@@ -126,7 +126,7 @@ app.get("/services/:id", async (req, res) => {
   }
 });
 
-// Add a new service
+// Service Related API's
 app.post("/services", async (req, res) => {
   try {
     const {
@@ -222,6 +222,13 @@ app.post("/services", async (req, res) => {
   }
 });
 
+app.patch("/services", async(req,res)=>{
+  
+})
+
+
+
+
 // Get all users
 app.get("/users", async (req, res) => {
   try {
@@ -237,6 +244,33 @@ app.get("/users", async (req, res) => {
     });
   }
 });
+
+//booking related api
+
+
+app.get("/bookings", async (req, res) => {
+  try {
+    const { email } = req.query;
+
+    if (!email) {
+      return res.status(400).json({ message: "Email is required." });
+    }
+
+    const bookings = db.collection("bookings");
+
+    const data = await bookings
+      .find({ customerEmail: email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json(data);
+  } catch (err) {
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+
+
 
 app.post("/bookings", async (req, res) => {
   try {
@@ -304,6 +338,73 @@ app.post("/bookings", async (req, res) => {
 
     res.status(201).json({ bookingId: result.insertedId });
   } catch (err) {
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+app.patch("/bookings/:id/status", async(req,res)=>{
+
+})
+
+app.delete('/bookings/:id', async(req,res)=>{
+
+})
+
+//Payment related API's
+
+// Get payments for a customer.
+//
+// There is no `payments` collection yet (Stripe is not wired up), so payment
+// records are DERIVED from the bookings collection:
+//   - paymentStatus === "paid"  -> status "paid"
+//   - otherwise                -> status "pending" (awaiting payment)
+// Cancelled / rejected bookings are not payments, so they are excluded.
+//
+// When Stripe is added later, switch this to read from a real `payments`
+// collection — the response shape stays the same, so the client won't change.
+
+app.get("/payments", async (req, res) => {
+  try {
+    const { email } = req.query;
+
+    if (!email) {
+      return res.status(400).json({ message: "Email is required." });
+    }
+
+    
+
+    const docs = await bookings
+      .find({ customerEmail: email, status: { $nin: ["cancelled", "rejected"] } })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const data = docs.map((b) => {
+      const paid = b.paymentStatus === "paid";
+
+      return {
+        _id: String(b._id),
+        bookingId: String(b._id),
+        customerEmail: b.customerEmail,
+        serviceTitle: b.serviceTitle,
+        technicianName: b.technicianName,
+        amount: b.finalAmount ?? b.basePrice ?? 0,
+        currency: "usd",
+        status: paid ? "paid" : "pending",
+        // No Stripe yet — these fill in once payments are wired up.
+        paymentMethod: undefined,
+        stripePaymentIntentId: undefined,
+        receiptUrl: undefined,
+        jobStatus: b.status,
+        completedAt:
+          b.status === "completed" ? (b.updatedAt ?? b.createdAt) : undefined,
+        createdAt: b.createdAt,
+        paidAt: paid ? (b.updatedAt ?? b.createdAt) : undefined,
+      };
+    });
+
+    res.status(200).json(data);
+  } catch (err) {
+    console.error("Get payments error:", err);
     res.status(500).json({ message: "Server error." });
   }
 });
