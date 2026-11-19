@@ -36,9 +36,9 @@ app.get('/', (req, res) => {
 
 
 // Get all services
-app.get('/services', async (req, res) => {
+app.get('/feature-services', async (req, res) => {
   try {
-    const data = await services.find().toArray();
+    const data = await services.find().limit(6).toArray();
     res.status(200).send(data);
   } catch (err) {
     res.status(500).send({
