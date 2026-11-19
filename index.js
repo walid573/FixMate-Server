@@ -47,6 +47,17 @@ app.get('/feature-services', async (req, res) => {
     });
   }
 });
+app.get('/services', async (req, res) => {
+  try {
+    const data = await services.find().toArray();
+    res.status(200).send(data);
+  } catch (err) {
+    res.status(500).send({
+      message: "Failed to fetch services",
+      error: err.message
+    });
+  }
+});
 
 
 // Get all users
