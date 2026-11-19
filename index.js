@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 
 const app = express();
 
@@ -44,6 +44,7 @@ const db = connectClient.db("fixmate");
 
 const users = db.collection("users");
 const services = db.collection("services");
+const bookings = db.collection("bookings")
 
 // Home route
 app.get("/", (req, res) => {
@@ -88,6 +89,39 @@ app.get("/services", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to fetch services",
+    });
+  }
+});
+
+
+app.get("/services/:id", async (req, res) => {
+  try {
+    const { id } = req.params; // destructure from req.params, not req.params.id
+
+    // Validate the id so an invalid string doesn't throw
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service id",
+      });
+    }
+
+    const service = await services.findOne({ _id: new ObjectId(id) });
+
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    res.status(200).json(service);
+  } catch (error) {
+    console.error("Get service error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch service",
     });
   }
 });
@@ -203,6 +237,78 @@ app.get("/users", async (req, res) => {
     });
   }
 });
+
+app.post("/bookings", async (req, res) => {
+  try {
+    const b = req.body;
+
+    if (
+      !b.serviceId ||
+      !b.customerEmail ||
+      !b.customerPhone ||
+      !b.address ||
+      !b.preferredDate ||
+      !b.problemDescription?.trim() ||
+      b.problemDescription.trim().length < 20
+    ) {
+      return res.status(400).json({ message: "Invalid or missing fields." });
+    }
+
+    const date = new Date(b.preferredDate);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    if (isNaN(date) || date < today) {
+      return res.status(400).json({ message: "Invalid preferred date." });
+    }
+
+    const service = await db.collection("services").findOne({
+      _id: new ObjectId(b.serviceId),
+    });
+
+    if (!service) {
+      return res.status(404).json({ message: "Service not found." });
+    }
+
+    
+
+    const duplicate = await bookings.findOne({
+      serviceId: b.serviceId,
+      customerEmail: b.customerEmail,
+      status: { $in: ["requested", "accepted", "in-progress"] },
+    });
+
+    if (duplicate) {
+      return res.status(409).json({ message: "Active booking already exists." });
+    }
+
+    const result = await bookings.insertOne({
+      serviceId: b.serviceId,
+      serviceTitle: service.title,
+      serviceImage: service.image,
+      category: service.category,
+      basePrice: service.basePrice,
+      technicianName: service.technicianName,
+      technicianEmail: service.technicianEmail,
+      customerName: b.customerName,
+      customerEmail: b.customerEmail,
+      customerPhone: b.customerPhone.trim(),
+      address: b.address.trim(),
+      preferredDate: date,
+      problemDescription: b.problemDescription.trim(),
+      status: "requested",
+      finalAmount: service.basePrice,
+      paymentStatus: "unpaid",
+      createdAt: new Date(),
+    });
+
+    res.status(201).json({ bookingId: result.insertedId });
+  } catch (err) {
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+
 
 // Start server
 app.listen(port, () => {
