@@ -52,16 +52,19 @@ app.get("/", (req, res) => {
 });
 
 // Get featured services
+
 app.get("/feature-services", async (req, res) => {
   try {
     const data = await services
       .find({
         approvalStatus: "approved",
-        availableForBooking: true,
+        isAvailable: true,
       })
       .sort({ createdAt: -1 })
       .limit(6)
       .toArray();
+
+    console.log("Featured services:", data.length);
 
     res.status(200).json(data);
   } catch (error) {
@@ -73,6 +76,8 @@ app.get("/feature-services", async (req, res) => {
     });
   }
 });
+
+
 
 // Get all services
 app.get("/services", async (req, res) => {
@@ -189,21 +194,25 @@ app.post("/services", async (req, res) => {
       });
     }
 
-    const serviceData = {
-      title: title.trim(),
-      category,
-      description: description.trim(),
-      basePrice: price,
-      estimatedDuration,
-      serviceArea: serviceArea.trim(),
-      serviceMode,
-      technicianName: technicianName.trim(),
-      technicianId,
-      image: image?.trim() || "",
-      availableForBooking: availableForBooking ?? true,
-      approvalStatus: "pending",
-      createdAt: new Date(),
-    };
+   const serviceData = {
+  title: title.trim(),
+  category,
+  description: description.trim(),
+  basePrice: price,
+  estimatedDuration,
+  serviceArea: serviceArea.trim(),
+  serviceMode,
+  technicianName: technicianName.trim(),
+  technicianId,
+  image: image?.trim() || "",
+
+  // Keep both availability fields synchronized
+  availableForBooking: availableForBooking ?? true,
+  isAvailable: availableForBooking ?? true,
+
+  approvalStatus: "pending",
+  createdAt: new Date(),
+};;
 
     const result = await services.insertOne(serviceData);
 
@@ -222,9 +231,165 @@ app.post("/services", async (req, res) => {
   }
 });
 
-app.patch("/services", async(req,res)=>{
+
+app.patch("/services", async (req, res) => {
+  try {
+    const { id, technicianId, ...updates } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid service id." });
+    }
+
+    if (!technicianId) {
+      return res.status(400).json({ message: "Technician id is required." });
+    }
+
+    const service = await services.findOne({
+      _id: new ObjectId(id),
+      technicianId,
+    });
+
+    if (!service) {
+      return res.status(404).json({ message: "Service not found." });
+    }
+
+    const CONTENT_FIELDS = [
+      "title",
+      "category",
+      "description",
+      "basePrice",
+      "estimatedDuration",
+      "serviceArea",
+      "serviceMode",
+      "image",
+    ];
+
+    const isContentEdit = CONTENT_FIELDS.some(
+      (field) => updates[field] !== undefined
+    );
+
+    const $set = { updatedAt: new Date() };
+
   
-})
+    if (isContentEdit) {
+      const {
+        title,
+        category,
+        description,
+        basePrice,
+        estimatedDuration,
+        serviceArea,
+        serviceMode,
+        image,
+      } = updates;
+
+      if (
+        !title?.trim() ||
+        !category ||
+        !description?.trim() ||
+        basePrice === undefined ||
+        !estimatedDuration ||
+        !serviceArea?.trim() ||
+        !serviceMode
+      ) {
+        return res.status(400).json({
+          message: "Please provide all required fields.",
+        });
+      }
+
+      const price = Number(basePrice);
+
+      if (!Number.isFinite(price) || price <= 0) {
+        return res
+          .status(400)
+          .json({ message: "Base price must be a valid positive number." });
+      }
+
+      if (description.trim().length < 30 || description.trim().length > 500) {
+        return res.status(400).json({
+          message: "Description must be between 30 and 500 characters.",
+        });
+      }
+
+      const validModes = ["Home Visit", "Shop Drop-off"];
+
+      if (!validModes.includes(serviceMode)) {
+        return res.status(400).json({ message: "Invalid service mode." });
+      }
+
+      Object.assign($set, {
+        title: title.trim(),
+        category,
+        description: description.trim(),
+        basePrice: price,
+        estimatedDuration,
+        serviceArea: serviceArea.trim(),
+        serviceMode,
+        image: image?.trim() || "",
+      });
+
+
+      $set.approvalStatus = "pending";
+    }
+
+
+    if (updates.availableForBooking !== undefined) {
+      if (typeof updates.availableForBooking !== "boolean") {
+        return res
+          .status(400)
+          .json({ message: "availableForBooking must be true or false." });
+      }
+
+      $set.availableForBooking = updates.availableForBooking;
+      // The service details page reads isAvailable, public pages read
+      // availableForBooking - keep them in step so one toggle does both.
+      $set.isAvailable = updates.availableForBooking;
+    }
+
+    // Nothing recognised in the payload.
+    if (Object.keys($set).length === 1) {
+      return res.status(400).json({ message: "Nothing to update." });
+    }
+
+    await services.updateOne({ _id: service._id }, { $set });
+
+    res.status(200).json({ ...service, ...$set });
+  } catch (error) {
+    console.error("Update service error:", error);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+
+app.delete("/services/:id", async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ message: "Invalid service id." });
+    }
+
+    const { technicianId } = req.query;
+
+    if (!technicianId) {
+      return res.status(400).json({ message: "Technician id is required." });
+    }
+
+    const service = await services.findOne({
+      _id: new ObjectId(req.params.id),
+      technicianId,
+    });
+
+    if (!service) {
+      return res.status(404).json({ message: "Service not found." });
+    }
+
+    await services.deleteOne({ _id: service._id });
+
+    res.status(200).json({ success: true, message: "Service deleted." });
+  } catch (error) {
+    console.error("Delete service error:", error);
+    res.status(500).json({ message: "Server error." });
+  }
+});
 
 
 
@@ -250,18 +415,23 @@ app.get("/users", async (req, res) => {
 
 app.get("/bookings", async (req, res) => {
   try {
-    const { email } = req.query;
+    const { email, technicianEmail } = req.query;
 
-    if (!email) {
-      return res.status(400).json({ message: "Email is required." });
+    if (!email && !technicianEmail) {
+      return res
+        .status(400)
+        .json({ message: "Either email or technicianEmail is required." });
     }
 
     const bookings = db.collection("bookings");
 
-    const data = await bookings
-      .find({ customerEmail: email })
-      .sort({ createdAt: -1 })
-      .toArray();
+    // Customers ask for their own bookings; technicians ask for the ones
+    // assigned to them. The two never overlap, so one query is enough.
+    const query = email
+      ? { customerEmail: email }
+      : { technicianEmail };
+
+    const data = await bookings.find(query).sort({ createdAt: -1 }).toArray();
 
     res.status(200).json(data);
   } catch (err) {
@@ -342,15 +512,139 @@ app.post("/bookings", async (req, res) => {
   }
 });
 
-app.patch("/bookings/:id/status", async(req,res)=>{
 
-})
+app.patch("/bookings/:id/status", async (req, res) => {
+  try {
+    const { status, customerEmail, technicianEmail, finalAmount } = req.body;
+
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ message: "Invalid booking id." });
+    }
+
+    if (
+      ![
+        "requested",
+        "accepted",
+        "in-progress",
+        "completed",
+        "cancelled",
+        "rejected",
+      ].includes(status)
+    ) {
+      return res.status(400).json({ message: "Invalid status." });
+    }
+
+    if (!customerEmail && !technicianEmail) {
+      return res
+        .status(400)
+        .json({ message: "Either customerEmail or technicianEmail is required." });
+    }
+
+    // Ownership check — the caller must be one of the two parties.
+    const ownerQuery = {};
+    if (customerEmail) ownerQuery.customerEmail = customerEmail;
+    if (technicianEmail) ownerQuery.technicianEmail = technicianEmail;
+
+    const booking = await bookings.findOne({
+      _id: new ObjectId(req.params.id),
+      ...ownerQuery,
+    });
+
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found." });
+    }
+
+    // ---- Transition guard -------------------------------------------------
+    // Each status can only move forward along the agreed path; terminal states
+    // are locked. This is what stops a completed job being "un-completed".
+    const ALLOWED_TRANSITIONS = {
+      requested: ["accepted", "rejected", "cancelled"],
+      accepted: ["in-progress", "rejected", "cancelled"],
+      "in-progress": ["completed", "rejected", "cancelled"],
+      completed: [],
+      cancelled: [],
+      rejected: [],
+    };
+
+    const current = booking.status;
+    const allowed = ALLOWED_TRANSITIONS[current] ?? [];
+
+    if (!allowed.includes(status)) {
+      return res.status(409).json({
+        message: `Cannot move a ${current} booking to ${status}.`,
+      });
+    }
+
+    await bookings.updateOne(
+      { _id: booking._id },
+      {
+        $set: {
+          status,
+          // `finalAmount` is OPTIONAL — only meaningful when completing a job
+          // (the technician sets the final price). Ignored for every other
+          // transition so the existing basePrice is preserved.
+          ...(finalAmount !== undefined && { finalAmount }),
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    res.status(200).json({ ...booking, status, ...(finalAmount !== undefined ? { finalAmount } : {}) });
+  } catch (err) {
+    console.error("Patch booking status error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
 
 app.delete('/bookings/:id', async(req,res)=>{
 
 })
 
 //Payment related API's
+
+// ---------------------------------------------------------------------------
+// MOCK STRIPE DATA
+//
+// Stripe is not wired up yet, so the PaymentIntent id and card details below
+// are DETERMINISTICALLY DERIVED from the booking id (same booking -> same
+// values on every request). Replace these with the real Stripe values once
+// the checkout flow exists — the response shape stays identical.
+// ---------------------------------------------------------------------------
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+const B62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+function toB62(n, len) {
+  let s = "";
+  for (let i = 0; i < len; i++) {
+    s += B62[n % 62];
+    n = Math.floor(n / 62);
+  }
+  return s;
+}
+
+// "pi_3qX9_a1f2" style PaymentIntent id, stable per booking.
+function mockPaymentIntentId(bookingId) {
+  const h = fnv1a(bookingId);
+  return `pi_${toB62(h, 4)}_${toB62(((h >>> 5) ^ 0x9e3779b9) >>> 0, 4)}`;
+}
+
+// { brand, last4 } card summary, stable per booking.
+function mockPaymentMethod(bookingId) {
+  const h = fnv1a(bookingId);
+  const brands = ["visa", "mastercard", "amex", "visa"];
+  return {
+    brand: brands[h % brands.length],
+    last4: String(1000 + ((h >>> 10) % 9000)),
+  };
+}
 
 // Get payments for a customer.
 //
@@ -359,6 +653,12 @@ app.delete('/bookings/:id', async(req,res)=>{
 //   - paymentStatus === "paid"  -> status "paid"
 //   - otherwise                -> status "pending" (awaiting payment)
 // Cancelled / rejected bookings are not payments, so they are excluded.
+//
+// `stripePaymentIntentId` and `paymentMethod` are MOCK values, returned ONLY
+// for bookings that are actually paid — a pending payment has no card or
+// PaymentIntent yet, so those fields come back undefined and the client
+// renders "—" until the payment settles.
+// `receiptUrl` stays empty until Stripe can issue real receipts.
 //
 // When Stripe is added later, switch this to read from a real `payments`
 // collection — the response shape stays the same, so the client won't change.
@@ -380,19 +680,22 @@ app.get("/payments", async (req, res) => {
 
     const data = docs.map((b) => {
       const paid = b.paymentStatus === "paid";
+      const id = String(b._id);
 
       return {
-        _id: String(b._id),
-        bookingId: String(b._id),
+        _id: id,
+        bookingId: id,
         customerEmail: b.customerEmail,
         serviceTitle: b.serviceTitle,
         technicianName: b.technicianName,
         amount: b.finalAmount ?? b.basePrice ?? 0,
         currency: "usd",
         status: paid ? "paid" : "pending",
-        // No Stripe yet — these fill in once payments are wired up.
-        paymentMethod: undefined,
-        stripePaymentIntentId: undefined,
+        // MOCK Stripe values — ONLY once the booking is actually paid.
+        // A pending booking has no card or PaymentIntent yet, so it renders
+        // "—" in the Method / Transaction ID columns until payment settles.
+        stripePaymentIntentId: paid ? mockPaymentIntentId(id) : undefined,
+        paymentMethod: paid ? mockPaymentMethod(id) : undefined,
         receiptUrl: undefined,
         jobStatus: b.status,
         completedAt:
