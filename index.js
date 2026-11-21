@@ -3,8 +3,23 @@ import cors from "cors";
 import "dotenv/config";
 import { MongoClient, ObjectId } from "mongodb";
 import Stripe from "stripe";
+import jwt from "jsonwebtoken";
 
 const app = express();
+
+// ---------------------------------------------------------------------------
+// JWT.
+//
+// The Next.js app owns login (better-auth, DB-backed session cookie). When a
+// session exists it mints a short-lived JWT signed with JWT_SECRET and sends
+// it as `Authorization: Bearer <token>` on mutating requests. We only VERIFY
+// here — issuing happens on the Next side in src/lib/jwt.ts.
+// ---------------------------------------------------------------------------
+const jwtSecret = process.env.JWT_SECRET;
+
+if (!jwtSecret) {
+  throw new Error("JWT_SECRET is missing from environment variables");
+}
 
 const port = process.env.PORT || 8000;
 
@@ -26,8 +41,52 @@ app.use(
   cors({
     origin: process.env.CLIENT_URL || "http://localhost:3000",
     methods: ["GET", "POST", "PATCH", "DELETE"],
+    // Required now that the browser sends `Authorization`. Without an explicit
+    // allow-list the preflight fails and every mutation 401s with a CORS error
+    // instead of a useful message.
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+
+// ---------------------------------------------------------------------------
+// requireAuth — guards MUTATING routes only (POST/PATCH/PUT/DELETE).
+//
+// GET/HEAD stay public so anonymous visitors can still browse services and
+// service details. Two exceptions are carved out:
+//   - /payments/webhook: Stripe calls it and cannot present a JWT; it is
+//     authenticated by its own HMAC signature instead.
+//
+// Applied via app.use rather than per-route so a route added later is
+// protected by default (fail closed) instead of silently staying open.
+// ---------------------------------------------------------------------------
+const MUTATING_METHODS = new Set(["POST", "PATCH", "PUT", "DELETE"]);
+const JWT_EXEMPT_PATHS = new Set(["/payments/webhook"]);
+
+function requireAuth(req, res, next) {
+  if (!MUTATING_METHODS.has(req.method)) return next();
+  if (JWT_EXEMPT_PATHS.has(req.path)) return next();
+
+  const header = req.headers.authorization || "";
+  const [scheme, token] = header.split(" ");
+
+  if (scheme !== "Bearer" || !token) {
+    return res
+      .status(401)
+      .json({ message: "Authentication required. Please sign in." });
+  }
+
+  try {
+    // Stashed on the request so routes can read the caller without re-parsing.
+    req.auth = jwt.verify(token, jwtSecret);
+    return next();
+  } catch {
+    return res
+      .status(401)
+      .json({ message: "Invalid or expired token. Please sign in again." });
+  }
+}
+
+app.use(requireAuth);
 
 // MongoDB connection
 const mongoUrl = process.env.MONGODB_URL;
