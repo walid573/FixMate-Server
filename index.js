@@ -49,44 +49,68 @@ app.use(
 );
 
 // ---------------------------------------------------------------------------
-// requireAuth — guards MUTATING routes only (POST/PATCH/PUT/DELETE).
+// JWT Middleware Suite
 //
-// GET/HEAD stay public so anonymous visitors can still browse services and
-// service details. Two exceptions are carved out:
-//   - /payments/webhook: Stripe calls it and cannot present a JWT; it is
-//     authenticated by its own HMAC signature instead.
+// Four custom Express middlewares for token verification and role-based access:
+// 1. verifyToken     - Validates JWT, fetches user from DB (fresh role), sets req.auth
+// 2. verifyCustomer  - Requires role === "customer"
+// 3. verifyTechnician- Requires role === "technician"
+// 4. verifyAdmin     - Requires role === "admin"
 //
-// Applied via app.use rather than per-route so a route added later is
-// protected by default (fail closed) instead of silently staying open.
+// Design: Role comes from DB (not token) so role changes apply instantly.
 // ---------------------------------------------------------------------------
-const MUTATING_METHODS = new Set(["POST", "PATCH", "PUT", "DELETE"]);
-const JWT_EXEMPT_PATHS = new Set(["/payments/webhook"]);
 
-function requireAuth(req, res, next) {
-  if (!MUTATING_METHODS.has(req.method)) return next();
-  if (JWT_EXEMPT_PATHS.has(req.path)) return next();
-
+async function verifyToken(req, res, next) {
   const header = req.headers.authorization || "";
   const [scheme, token] = header.split(" ");
 
   if (scheme !== "Bearer" || !token) {
-    return res
-      .status(401)
-      .json({ message: "Authentication required. Please sign in." });
+    return res.status(401).json({ message: "Authentication required. Please sign in." });
   }
 
   try {
-    // Stashed on the request so routes can read the caller without re-parsing.
-    req.auth = jwt.verify(token, jwtSecret);
+    const payload = jwt.verify(token, jwtSecret);
+
+    // Fetch user from DB to get CURRENT role (not from token)
+    const user = await users.findOne({ email: payload.email });
+    if (!user) {
+      return res.status(401).json({ message: "Unauthorized: User not found." });
+    }
+
+    // Attach verified user info (email + role from DB + any other payload fields)
+    req.auth = { email: payload.email, role: user.role, ...payload };
     return next();
-  } catch {
-    return res
-      .status(401)
-      .json({ message: "Invalid or expired token. Please sign in again." });
+  } catch (err) {
+    if (err.name === "TokenExpiredError") {
+      return res.status(401).json({ message: "Token expired. Please sign in again." });
+    }
+    return res.status(401).json({ message: "Invalid or expired token. Please sign in again." });
   }
 }
 
-app.use(requireAuth);
+function verifyCustomer(req, res, next) {
+  if (req.auth?.role !== "customer") {
+    return res.status(403).json({ message: "Forbidden: Customers only." });
+  }
+  next();
+}
+
+function verifyTechnician(req, res, next) {
+  if (req.auth?.role !== "technician") {
+    return res.status(403).json({ message: "Forbidden: Technicians only." });
+  }
+  next();
+}
+
+function verifyAdmin(req, res, next) {
+  if (req.auth?.role !== "admin") {
+    return res.status(403).json({ message: "Forbidden: Admins only." });
+  }
+  next();
+}
+
+// REMOVE the global requireAuth - we'll apply middlewares per-route instead
+// app.use(requireAuth);  // REMOVED
 
 // MongoDB connection
 const mongoUrl = process.env.MONGODB_URL;
@@ -327,7 +351,8 @@ app.get("/services/:id", async (req, res) => {
 });
 
 // Service Related API's
-app.post("/services", async (req, res) => {
+// POST /services - Technician only
+app.post("/services", verifyToken, verifyTechnician, async (req, res) => {
   try {
     const {
       title,
@@ -338,10 +363,12 @@ app.post("/services", async (req, res) => {
       serviceArea,
       serviceMode,
       technicianName,
-      technicianId,
       image,
       availableForBooking,
     } = req.body;
+
+    // Get technicianId from verified token
+    const technicianId = req.auth.technicianId || req.auth.sub;
 
     // Required field validation
     if (
@@ -407,7 +434,7 @@ app.post("/services", async (req, res) => {
 
   approvalStatus: "pending",
   createdAt: new Date(),
-};;
+};
 
     const result = await services.insertOne(serviceData);
 
@@ -427,16 +454,18 @@ app.post("/services", async (req, res) => {
 });
 
 
-app.patch("/services", async (req, res) => {
+// PATCH /services - Technician only (own services)
+app.patch("/services", verifyToken, verifyTechnician, async (req, res) => {
   try {
-    const { id, technicianId, ...updates } = req.body;
+    const { id, ...updates } = req.body;
+    const technicianId = req.auth.technicianId || req.auth.sub; // technicianId from token
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({ message: "Invalid service id." });
     }
 
     if (!technicianId) {
-      return res.status(400).json({ message: "Technician id is required." });
+      return res.status(400).json({ message: "Technician id not found in token." });
     }
 
     const service = await services.findOne({
@@ -556,16 +585,17 @@ app.patch("/services", async (req, res) => {
 });
 
 
-app.delete("/services/:id", async (req, res) => {
+// DELETE /services/:id - Technician only (own services)
+app.delete("/services/:id", verifyToken, verifyTechnician, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ message: "Invalid service id." });
     }
 
-    const { technicianId } = req.query;
+    const technicianId = req.auth.technicianId || req.auth.sub;
 
     if (!technicianId) {
-      return res.status(400).json({ message: "Technician id is required." });
+      return res.status(400).json({ message: "Technician id not found in token." });
     }
 
     const service = await services.findOne({
@@ -591,7 +621,8 @@ app.delete("/services/:id", async (req, res) => {
 //
 // PATCH /services/:id/approval with { status: "approved" | "rejected" }.
 // ---------------------------------------------------------------------------
-app.patch("/services/:id/approval", async (req, res) => {
+// PATCH /services/:id/approval - Admin only
+app.patch("/services/:id/approval", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const { status } = req.body;
     const { id } = req.params;
@@ -621,8 +652,8 @@ app.patch("/services/:id/approval", async (req, res) => {
   }
 });
 
-// Get all users
-app.get("/users", async (req, res) => {
+// Get all users - Admin only
+app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const data = await users.find().toArray();
 
@@ -637,13 +668,59 @@ app.get("/users", async (req, res) => {
   }
 });
 
+// GET /users/profile - Any authenticated user gets their own profile
+app.get("/users/profile", verifyToken, async (req, res) => {
+  try {
+    const user = await users.findOne({ email: req.auth.email });
+    if (!user) {
+      return res.status(404).json({ message: "User not found." });
+    }
+    // Return user without sensitive data
+    const { password, ...safeUser } = user;
+    res.status(200).json(safeUser);
+  } catch (err) {
+    console.error("Get user profile error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+// PATCH /users/profile - Any authenticated user can update their own profile
+app.patch("/users/profile", verifyToken, async (req, res) => {
+  try {
+    const { name, phone, address } = req.body;
+    const email = req.auth.email;
+
+    const updateData = { updatedAt: new Date() };
+    if (name) updateData.name = name;
+    if (phone) updateData.phone = phone;
+    if (address) updateData.address = address;
+
+    const result = await users.updateOne(
+      { email },
+      { $set: updateData }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    const updated = await users.findOne({ email });
+    const { password, ...safeUser } = updated;
+    res.status(200).json(safeUser);
+  } catch (err) {
+    console.error("Patch user profile error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Update a user's role (admin only).
 //
 // PATCH /users/:id/role with { role } — enforces a valid role and returns
 // the updated user document.
 // ---------------------------------------------------------------------------
-app.patch("/users/:id/role", async (req, res) => {
+// PATCH /users/:id/role - Admin only
+app.patch("/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const { role } = req.body;
     const { id } = req.params;
@@ -675,24 +752,24 @@ app.patch("/users/:id/role", async (req, res) => {
 
 //booking related api
 
-
-app.get("/bookings", async (req, res) => {
+// GET /bookings - Customer: own bookings, Technician: assigned bookings
+// Uses req.auth.email from verified token (not query param)
+app.get("/bookings", verifyToken, async (req, res) => {
   try {
-    const { email, technicianEmail } = req.query;
-
-    if (!email && !technicianEmail) {
-      return res
-        .status(400)
-        .json({ message: "Either email or technicianEmail is required." });
-    }
-
     const bookings = db.collection("bookings");
+    const { role, email } = req.auth;
 
-    // Customers ask for their own bookings; technicians ask for the ones
-    // assigned to them. The two never overlap, so one query is enough.
-    const query = email
-      ? { customerEmail: email }
-      : { technicianEmail };
+    // Build query based on user's role - prevent accessing others' data
+    let query;
+    if (role === "customer") {
+      query = { customerEmail: email };
+    } else if (role === "technician") {
+      query = { technicianEmail: email };
+    } else if (role === "admin") {
+      query = {}; // Admin sees all
+    } else {
+      return res.status(403).json({ message: "Forbidden: Unknown role." });
+    }
 
     const data = await bookings.find(query).sort({ createdAt: -1 }).toArray();
 
@@ -708,7 +785,8 @@ app.get("/bookings", async (req, res) => {
 // GET /bookings/all — returns every booking on the platform, sorted newest
 // first. No filter is applied because admins need the full picture.
 // ---------------------------------------------------------------------------
-app.get("/bookings/all", async (req, res) => {
+// GET /bookings/all - Admin only
+app.get("/bookings/all", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const bookings = db.collection("bookings");
     const data = await bookings.find().sort({ createdAt: -1 }).toArray();
@@ -722,13 +800,17 @@ app.get("/bookings/all", async (req, res) => {
 
 
 
-app.post("/bookings", async (req, res) => {
+// POST /bookings - Customer only
+app.post("/bookings", verifyToken, verifyCustomer, async (req, res) => {
   try {
     const b = req.body;
 
+    // Use email from verified token, not from request body
+    const customerEmail = req.auth.email;
+
     if (
       !b.serviceId ||
-      !b.customerEmail ||
+      !customerEmail ||
       !b.customerPhone ||
       !b.address ||
       !b.preferredDate ||
@@ -774,7 +856,7 @@ app.post("/bookings", async (req, res) => {
 
     const duplicate = await bookings.findOne({
       serviceId: b.serviceId,
-      customerEmail: b.customerEmail,
+      customerEmail: customerEmail,
       status: { $in: ["requested", "accepted", "in-progress"] },
     });
 
@@ -791,7 +873,7 @@ app.post("/bookings", async (req, res) => {
       technicianName: technicianName,
       technicianEmail: technicianEmail,
       customerName: b.customerName,
-      customerEmail: b.customerEmail,
+      customerEmail: customerEmail,
       customerPhone: b.customerPhone.trim(),
       address: b.address.trim(),
       preferredDate: date,
@@ -808,7 +890,7 @@ app.post("/bookings", async (req, res) => {
     // 1:1 relation and makes the backfill on startup idempotent.
     await payments.insertOne({
       bookingId: String(result.insertedId),
-      customerEmail: b.customerEmail,
+      customerEmail: customerEmail,
       serviceTitle: service.title,
       technicianName: technicianName,
       amount: service.basePrice,
@@ -830,9 +912,11 @@ app.post("/bookings", async (req, res) => {
 });
 
 
-app.patch("/bookings/:id/status", async (req, res) => {
+// PATCH /bookings/:id/status - Technician only (updates job status)
+app.patch("/bookings/:id/status", verifyToken, verifyTechnician, async (req, res) => {
   try {
-    const { status, customerEmail, technicianEmail, finalAmount } = req.body;
+    const { status, finalAmount } = req.body;
+    const technicianEmail = req.auth.email;
 
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ message: "Invalid booking id." });
@@ -851,12 +935,6 @@ app.patch("/bookings/:id/status", async (req, res) => {
       return res.status(400).json({ message: "Invalid status." });
     }
 
-    if (!customerEmail && !technicianEmail) {
-      return res
-        .status(400)
-        .json({ message: "Either customerEmail or technicianEmail is required." });
-    }
-
     // `finalAmount` must be a real, positive price whenever it is provided.
     // A $0 booking is impossible downstream — Stripe cannot charge zero, and
     // the checkout would silently fall back to basePrice — so reject it here
@@ -870,18 +948,14 @@ app.patch("/bookings/:id/status", async (req, res) => {
       }
     }
 
-    // Ownership check — the caller must be one of the two parties.
-    const ownerQuery = {};
-    if (customerEmail) ownerQuery.customerEmail = customerEmail;
-    if (technicianEmail) ownerQuery.technicianEmail = technicianEmail;
-
+    // Ownership check — the caller must be the assigned technician
     const booking = await bookings.findOne({
       _id: new ObjectId(req.params.id),
-      ...ownerQuery,
+      technicianEmail: technicianEmail,
     });
 
     if (!booking) {
-      return res.status(404).json({ message: "Booking not found." });
+      return res.status(404).json({ message: "Booking not found or not assigned to you." });
     }
 
     // ---- Transition guard -------------------------------------------------
@@ -930,10 +1004,10 @@ app.patch("/bookings/:id/status", async (req, res) => {
 // ---------------------------------------------------------------------------
 // Edit the final amount of an ALREADY-COMPLETED job.
 //
-// PATCH /bookings/:id/final-amount  { technicianEmail, finalAmount }
+// PATCH /bookings/:id/final-amount  { finalAmount }  (technician from token)
 //
 // The technician owns the price, but only until the customer pays:
-//   - caller must be the booking's technician
+//   - caller must be the booking's technician (verified via JWT)
 //   - booking must be "completed" (the price only exists then)
 //   - booking must NOT be paid yet (a paid price is locked forever)
 //   - finalAmount must be > 0 — a $0 job cannot exist: Stripe cannot
@@ -942,16 +1016,14 @@ app.patch("/bookings/:id/status", async (req, res) => {
 // This is also how a mistyped 0 gets corrected: the value can be edited
 // here until the customer settles the payment.
 // ---------------------------------------------------------------------------
-app.patch("/bookings/:id/final-amount", async (req, res) => {
+// PATCH /bookings/:id/final-amount - Technician only
+app.patch("/bookings/:id/final-amount", verifyToken, verifyTechnician, async (req, res) => {
   try {
-    const { technicianEmail, finalAmount } = req.body;
+    const { finalAmount } = req.body;
+    const technicianEmail = req.auth.email;
 
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ message: "Invalid booking id." });
-    }
-
-    if (!technicianEmail) {
-      return res.status(400).json({ message: "technicianEmail is required." });
     }
 
     const amount = Number(finalAmount);
@@ -967,7 +1039,7 @@ app.patch("/bookings/:id/final-amount", async (req, res) => {
     });
 
     if (!booking) {
-      return res.status(404).json({ message: "Booking not found." });
+      return res.status(404).json({ message: "Booking not found or not assigned to you." });
     }
 
     if (booking.status !== "completed") {
@@ -994,8 +1066,40 @@ app.patch("/bookings/:id/final-amount", async (req, res) => {
   }
 });
 
-app.delete('/bookings/:id', async(req,res)=>{
+// DELETE /bookings/:id - Customer only (cancel own booking)
+app.delete('/bookings/:id', verifyToken, verifyCustomer, async(req,res)=>{
+  try {
+    const { id } = req.params;
+    const customerEmail = req.auth.email;
 
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid booking id." });
+    }
+
+    const booking = await bookings.findOne({
+      _id: new ObjectId(id),
+      customerEmail,
+    });
+
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found." });
+    }
+
+    // Only allow cancellation of non-terminal states
+    if (["completed", "cancelled", "rejected"].includes(booking.status)) {
+      return res.status(409).json({ message: `Cannot cancel a ${booking.status} booking.` });
+    }
+
+    await bookings.updateOne(
+      { _id: booking._id },
+      { $set: { status: "cancelled", updatedAt: new Date() } }
+    );
+
+    res.status(200).json({ message: "Booking cancelled successfully." });
+  } catch (err) {
+    console.error("Delete booking error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
 })
 
 //Payment related API's
@@ -1003,7 +1107,7 @@ app.delete('/bookings/:id', async(req,res)=>{
 // ---------------------------------------------------------------------------
 // Stripe Checkout — create a session for ONE completed booking.
 //
-// POST /payments/checkout-session  { bookingId, customerEmail }
+// POST /payments/checkout-session  { bookingId }  (customerEmail from token)
 //
 // Pay-after-service model: only a booking the technician marked "completed"
 // can be paid, and only once. The AMOUNT ALWAYS comes from the booking
@@ -1011,15 +1115,14 @@ app.delete('/bookings/:id', async(req,res)=>{
 // customerEmail travel in the session metadata so the verify step can
 // settle the right records afterwards.
 // ---------------------------------------------------------------------------
-app.post("/payments/checkout-session", async (req, res) => {
+// POST /payments/checkout-session - Customer only
+app.post("/payments/checkout-session", verifyToken, verifyCustomer, async (req, res) => {
   try {
-    const { bookingId, customerEmail } = req.body;
+    const { bookingId } = req.body;
+    const customerEmail = req.auth.email;
 
     if (!bookingId || !ObjectId.isValid(bookingId)) {
       return res.status(400).json({ message: "Invalid booking id." });
-    }
-    if (!customerEmail) {
-      return res.status(400).json({ message: "customerEmail is required." });
     }
 
     const booking = await bookings.findOne({ _id: new ObjectId(bookingId) });
@@ -1199,21 +1302,23 @@ async function settlePaidSession(session) {
 // ---------------------------------------------------------------------------
 // Stripe Checkout — verify and settle a payment.
 //
-// POST /payments/verify  { sessionId, customerEmail }
+// POST /payments/verify  { sessionId }  (customerEmail from token)
 //
 // Called by the success page via the protected /api/payments/verify
 // handler. Ownership is checked here; the save runs through the shared
 // settlePaidSession(), so this route and the webhook can never double-save
 // the same payment.
 // ---------------------------------------------------------------------------
-app.post("/payments/verify", async (req, res) => {
+// POST /payments/verify - Customer only
+app.post("/payments/verify", verifyToken, verifyCustomer, async (req, res) => {
   try {
-    const { sessionId, customerEmail } = req.body;
+    const { sessionId } = req.body;
+    const customerEmail = req.auth.email;
 
-    if (!sessionId || !customerEmail) {
+    if (!sessionId) {
       return res
         .status(400)
-        .json({ message: "sessionId and customerEmail are required." });
+        .json({ message: "sessionId is required." });
     }
 
     const session = await stripe.checkout.sessions.retrieve(sessionId, {
@@ -1380,15 +1485,12 @@ async function paymentsAggregate(match = {}) {
 }
 
 // Get payments for a customer (REAL data from the `payments` collection).
-app.get("/payments", async (req, res) => {
+// GET /payments - Customer only
+app.get("/payments", verifyToken, verifyCustomer, async (req, res) => {
   try {
-    const { email } = req.query;
+    const customerEmail = req.auth.email;
 
-    if (!email) {
-      return res.status(400).json({ message: "Email is required." });
-    }
-
-    const data = await paymentsAggregate({ customerEmail: email });
+    const data = await paymentsAggregate({ customerEmail });
     res.status(200).json(data);
   } catch (err) {
     console.error("Get payments error:", err);
@@ -1401,7 +1503,8 @@ app.get("/payments", async (req, res) => {
 //
 // GET /payments/all — every payment on the platform, newest first.
 // ---------------------------------------------------------------------------
-app.get("/payments/all", async (req, res) => {
+// GET /payments/all - Admin only
+app.get("/payments/all", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const data = await paymentsAggregate();
     res.status(200).json(data);
