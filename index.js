@@ -206,22 +206,24 @@ app.post(
           }
         }
 
-        // Idempotent payment insertion
+        // Idempotent payment insertion. $set fields must NOT also appear in
+        // $setOnInsert — MongoDB rejects an upsert that writes the same path
+        // with two different operators (ConflictingUpdateOperators).
         try {
+          const { receiptUrl, paymentMethod, ...insertFields } = paymentData;
+          const repairFields = {};
+          if (receiptUrl) repairFields.receiptUrl = receiptUrl;
+          if (paymentMethod) repairFields.paymentMethod = paymentMethod;
+
           await payments.updateOne(
             { stripeSessionId: session.id },
             {
-              $setOnInsert: paymentData,
-              // A retry must also be able to repair an older record that was
-              // saved before the receipt_url fix shipped.
-              ...(paymentData.receiptUrl && {
-                $set: {
-                  receiptUrl: paymentData.receiptUrl,
-                  ...(paymentData.paymentMethod && {
-                    paymentMethod: paymentData.paymentMethod,
-                  }),
-                },
-              }),
+              $setOnInsert: insertFields,
+              // A retry can still repair an older record saved before the
+              // receipt-URL fix shipped.
+              ...(Object.keys(repairFields).length
+                ? { $set: repairFields }
+                : {}),
             },
             { upsert: true }
           );
@@ -263,11 +265,7 @@ app.post(
 );
 
 
-// The assignment spells private endpoints with an /api prefix. The Next.js
-// app talks to the bare Express paths, so simply drop "/api" and keep the rest
-// of the path intact. Stripping "/api/admin" as well used to collide with the
-// customer routes (/api/admin/bookings -> /bookings) and 404 on the receipt
-// route. /admin/* aliases are registered next to each bare route below.
+
 app.use((req, _res, next) => {
   if (req.url.startsWith("/api/")) {
     req.url = req.url.slice("/api".length);
@@ -275,12 +273,10 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Normal JSON middleware AFTER Stripe webhook
+
 app.use(express.json());
 
-// Allow every client origin we actually serve. The deployed app can be
-// reached under both the preview and the production Vercel domain, so a
-// single CLIENT_URL is not enough.
+
 const allowedOrigins = [
   process.env.CLIENT_URL,
   process.env.CLIENT_URLS,
@@ -295,12 +291,10 @@ const allowedOrigins = [
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Non-browser requests (server actions, health checks) have no Origin.
       if (!origin || allowedOrigins.includes(origin)) {
         return callback(null, origin || true);
       }
-      // Don't throw — that would turn a disallowed browser origin into a
-      // 500. Simply omit the ACAO header so the browser blocks the response.
+ 
       return callback(null, false);
     },
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
@@ -316,9 +310,6 @@ if (!mongoUrl) {
   throw new Error("MONGODB_URL is missing from environment variables");
 }
 
-// Reuse ONE small pool across warm serverless invocations. A fresh client per
-// invocation (plus the old per-request client in the Next.js role route) is
-// what pushed Atlas to 500/500 connections. Keep the pool tiny on purpose.
 const globalForMongo = globalThis;
 const mongoState =
   globalForMongo.__fixmateServerMongoState ??
@@ -360,33 +351,81 @@ const services = db.collection("services");
 const bookings = db.collection("bookings")
 const payments = db.collection("payments");
 
-// ---- Shared query helpers -------------------------------------------------
 const escapeRe = (value) =>
   String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-// Case-insensitive, whole-value match (emails, exact mode names, ...).
+
 const ciExact = (value) => ({
   $regex: `^${escapeRe(value)}$`,
   $options: "i",
 });
 
-// Category matching that treats "Laptop & PC", "laptop-pc" and "LAPTOP PC"
-// as the same category. This lets the home-page category cards and the
-// /services dropdown agree even though one uses slugs and one uses labels.
-const categoryMatcher = (value) => {
-  const parts = String(value ?? "")
-    .split(/[^a-zA-Z0-9]+/)
-    .filter(Boolean)
-    .map(escapeRe);
 
-  if (!parts.length) return undefined;
-  if (parts.length === 1) {
-    // A single word may be the start of a longer category ("laptop" -> "Laptop & PC").
-    return { $regex: `^${parts[0]}(?:[^a-zA-Z0-9].*)?$`, $options: "i" };
-  }
+const CANONICAL_CATEGORIES = [
+  "Smartphone",
+  "Laptop & PC",
+  "AC",
+  "Refrigerator",
+  "TV",
+  "Washing Machine",
+  "Electrical",
+];
+
+// Older versions of the add-service form wrote lowercase/legacy values. Map
+// every known variant onto the canonical label so filters and the category
+// dropdown stay free of duplicates like "ac" + "AC".
+const CATEGORY_ALIASES = {
+  smartphone: "Smartphone",
+  smartphonerepair: "Smartphone",
+  mobile: "Smartphone",
+  laptop: "Laptop & PC",
+  laptopservicing: "Laptop & PC",
+  laptoppc: "Laptop & PC",
+  ac: "AC",
+  acservicing: "AC",
+  airconditioner: "AC",
+  refrigerator: "Refrigerator",
+  fridge: "Refrigerator",
+  tv: "TV",
+  tvrepair: "TV",
+  television: "TV",
+  washingmachine: "Washing Machine",
+  electrical: "Electrical",
+  appliance: "Electrical",
+  homeappliance: "Electrical",
+};
+
+const canonicalCategory = (value) => {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const key = raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (CATEGORY_ALIASES[key]) return CATEGORY_ALIASES[key];
+  const exact = CANONICAL_CATEGORIES.find(
+    (c) => c.toLowerCase() === raw.toLowerCase()
+  );
+  return exact || raw;
+};
+
+// Every stored spelling that belongs to a canonical label. Matching all of
+// them keeps old/free-form documents filterable even though the dropdown now
+// only shows canonical labels.
+const CATEGORY_VARIANTS = {
+  Smartphone: ["Smartphone", "Smartphone Repair", "smartphone", "Mobile"],
+  "Laptop & PC": ["Laptop & PC", "Laptop Servicing", "laptop", "Laptop PC"],
+  AC: ["AC", "AC Servicing", "ac", "Air Conditioner"],
+  Refrigerator: ["Refrigerator", "fridge"],
+  TV: ["TV", "TV Repair", "television"],
+  "Washing Machine": ["Washing Machine"],
+  Electrical: ["Electrical", "Home Appliance", "appliance"],
+};
+
+const categoryMatcher = (value) => {
+  const canonical = canonicalCategory(value);
+  // "all" is the dropdown's no-filter value; never send it to MongoDB.
+  if (!canonical || canonical.toLowerCase() === "all") return undefined;
+  const variants = CATEGORY_VARIANTS[canonical] || [canonical];
   return {
-    $regex: `^${parts.join("[^a-zA-Z0-9]*")}$`,
-    $options: "i",
+    $in: variants.map((v) => new RegExp(`^${escapeRe(v)}$`, "i")),
   };
 };
 
@@ -394,19 +433,8 @@ const categoryMatcher = (value) => {
 
 
 
-// 1. Verify authentication token
-//
-// The Next.js better-auth config signs the JWT with HS256 using the shared
-// JWT_SECRET (see src/lib/auth.ts). We must verify with the SAME algorithm and
-// secret — verifying an HS256 token against a remote JWKS (RS256) always fails
-// with 401, which is what starved every protected endpoint of data.
-const AUTH_URL = process.env.AUTH_URL;
-// AUTH_URL is optional now. Tokens are authenticated by the shared JWT_SECRET
-// (HS256), so a client-URL mismatch can no longer reject every request.
 
-// AUTH_URL may hold several client URLs, comma-separated, e.g.
-// "http://localhost:3000,https://fix-mate-client.vercel.app" - so the same
-// server accepts tokens from both a local and a deployed client.
+const AUTH_URL = process.env.AUTH_URL;
 const AUTH_URLS = (AUTH_URL || "").split(",")
   .map((u) => u.trim().replace(/\/+$/, ""))
   .filter(Boolean);
@@ -415,9 +443,6 @@ const jwtSecret = process.env.JWT_SECRET;
 if (!jwtSecret) throw new Error("JWT_SECRET is missing from .env");
 
 const jwtKey = new TextEncoder().encode(jwtSecret);
-
-// Pin the algorithm. Issuer/audience are only enforced if you opt in by setting
-// ENFORCE_TOKEN_ISSUER=true (then AUTH_URL must list every client URL).
 const verifyOptions = { algorithms: ["HS256"] };
 if (process.env.ENFORCE_TOKEN_ISSUER === "true" && AUTH_URLS.length) {
   verifyOptions.issuer = AUTH_URLS;
@@ -482,9 +507,6 @@ const verifyAdmin = (req, res, next) => {
   next();
 };
 
-// Optional auth for the PUBLIC catalogue endpoints. Anonymous callers and
-// customers are allowed through (visibility is then forced in the handler),
-// but a valid token lets admins/technicians see their own listings.
 const optionalAuth = async (req, _res, next) => {
   const header = req.headers.authorization;
   if (header?.startsWith("Bearer ")) {
@@ -562,9 +584,7 @@ app.get("/feature-services", async (req, res) => {
 
 
 
-// Get all services — searching, filtering and sorting happen HERE, in MongoDB.
-// Public browse sends approvalStatus/isAvailable; technician dashboards send
-// technicianEmail/technicianId and deliberately omit those public filters.
+
 app.get("/services", optionalAuth, async (req, res) => {
   try {
     const {
@@ -580,12 +600,6 @@ app.get("/services", optionalAuth, async (req, res) => {
 
     const query = {};
     const role = req.user?.role;
-
-    // Public catalogue visibility. Only admins see everything; technicians
-    // see just their own listings (any status) so My Services / edit keep
-    // working. Everyone else — anonymous visitors and customers — can only
-    // ever receive approved AND available services, no matter what query
-    // params they supply.
     if (role === "technician") {
       query.technicianEmail = ciExact(req.user.email);
     } else if (role !== "admin") {
@@ -593,11 +607,13 @@ app.get("/services", optionalAuth, async (req, res) => {
       query.isAvailable = true;
     }
 
-    if (technicianEmail) query.technicianEmail = ciExact(technicianEmail);
-    if (technicianId) query.technicianId = String(technicianId);
-
-    // Status/availability filters are meaningful only for privileged
-    // callers. Public callers must not be able to widen visibility.
+    // A technician may never override the ownership scope with a query param.
+    if (technicianEmail && role !== "technician") {
+      query.technicianEmail = ciExact(technicianEmail);
+    }
+    if (technicianId && role !== "technician") {
+      query.technicianId = String(technicianId);
+    }
     if (approvalStatus && (role === "admin" || role === "technician")) {
       query.approvalStatus = String(approvalStatus);
     }
@@ -613,8 +629,7 @@ app.get("/services", optionalAuth, async (req, res) => {
     const categoryFilter = category ? categoryMatcher(category) : undefined;
     if (categoryFilter) query.category = categoryFilter;
 
-    // Search by service title or category. Match whole words (or word
-    // beginnings), so "AC" doesn't accidentally match "Wa-shing Ma-chine".
+  
     const term = String(search ?? "").trim();
     if (term) {
       const words = term.split(/\s+/).filter(Boolean).map(escapeRe);
@@ -630,8 +645,6 @@ app.get("/services", optionalAuth, async (req, res) => {
       ];
     }
 
-    // Sort entirely on the server. createdAt is the tie-breaker so documents
-    // without a createdAt still get a stable "newest first" order.
     const sortSpec =
       sort === "price-asc"
         ? { basePrice: 1, _id: -1 }
@@ -659,7 +672,11 @@ app.get("/services/categories", async (_req, res) => {
       .project({ category: 1 })
       .toArray();
     const categories = [
-      ...new Set(rows.map((r) => String(r.category || "").trim()).filter(Boolean)),
+      ...new Set(
+        rows
+          .map((r) => canonicalCategory(r.category))
+          .filter(Boolean)
+      ),
     ].sort((a, b) => a.localeCompare(b));
     res.status(200).json(categories);
   } catch (error) {
@@ -707,7 +724,7 @@ app.get("/technicians", async (req, res) => {
 });
 
 // Update a user's role (admin only). The handler is shared by the bare route
-// and the /admin alias so the /api prefix rewrite cannot bypass the guard.
+// and the /admin alias so the /api prefix rewrite cannot bypass the guard.ver
 async function updateUserRoleHandler(req, res) {
   try {
     const { role } = req.body;
@@ -1362,7 +1379,16 @@ app.post("/bookings",verifyToken, verifyCustomer,async (req, res) => {
       return res.status(404).json({ message: "Service not found." });
     }
 
-    
+    // A repair request may only be sent for a live, admin-approved listing.
+    if (
+      service.approvalStatus !== "approved" ||
+      service.isAvailable === false ||
+      service.availableForBooking === false
+    ) {
+      return res
+        .status(404)
+        .json({ message: "Service not found or not available." });
+    }
 
     const duplicate = await bookings.findOne({
       serviceId: b.serviceId,
@@ -1530,8 +1556,8 @@ app.patch("/bookings/:id/status", verifyToken, verifyTechnician, async (req, res
     // are locked, so a job can never be re-opened or "un-completed".
     const ALLOWED_TRANSITIONS = {
       requested: ["accepted", "rejected"],
-      accepted: ["in-progress", "rejected"],
-      "in-progress": ["completed", "rejected"],
+      accepted: ["in-progress"],
+      "in-progress": ["completed"],
       completed: [],
       cancelled: [],
       rejected: [],
