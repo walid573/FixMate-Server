@@ -61,6 +61,23 @@ async function fetchReceiptUrl(stripePaymentIntentId) {
   }
 }
 
+// Fetch + cache a receipt for a payment record that was saved before Stripe
+// had generated the receipt URL (common right after Checkout redirects).
+async function backfillPaymentReceipt(payment) {
+  if (!payment) return null;
+  if (payment.receiptUrl) return payment.receiptUrl;
+  if (!payment.stripePaymentIntentId) return null;
+
+  const receiptUrl = await fetchReceiptUrl(payment.stripePaymentIntentId);
+  if (receiptUrl) {
+    await payments.updateOne(
+      { _id: payment._id },
+      { $set: { receiptUrl } }
+    );
+  }
+  return receiptUrl;
+}
+
 // Helper function to fetch payment method details from Stripe
 async function fetchPaymentMethod(stripePaymentIntentId) {
   if (!stripePaymentIntentId) return null;
@@ -153,6 +170,11 @@ app.post(
             typeof session.payment_intent === "string"
               ? session.payment_intent
               : "",
+          // Design field name for the Stripe payment intent id.
+          transactionId:
+            typeof session.payment_intent === "string"
+              ? session.payment_intent
+              : "",
           customerName: booking.customerName || "",
           customerEmail: booking.customerEmail,
           technicianName: booking.technicianName || "",
@@ -242,12 +264,12 @@ app.post(
 
 
 // The assignment spells private endpoints with an /api prefix. The Next.js
-// app talks to the bare Express paths (e.g. /bookings), so accept both forms.
-// /api/admin/users -> /users (the admin guard is on the route itself).
+// app talks to the bare Express paths, so simply drop "/api" and keep the rest
+// of the path intact. Stripping "/api/admin" as well used to collide with the
+// customer routes (/api/admin/bookings -> /bookings) and 404 on the receipt
+// route. /admin/* aliases are registered next to each bare route below.
 app.use((req, _res, next) => {
-  if (req.url.startsWith("/api/admin/")) {
-    req.url = req.url.slice("/api/admin".length);
-  } else if (req.url.startsWith("/api/")) {
+  if (req.url.startsWith("/api/")) {
     req.url = req.url.slice("/api".length);
   }
   next();
@@ -256,10 +278,32 @@ app.use((req, _res, next) => {
 // Normal JSON middleware AFTER Stripe webhook
 app.use(express.json());
 
+// Allow every client origin we actually serve. The deployed app can be
+// reached under both the preview and the production Vercel domain, so a
+// single CLIENT_URL is not enough.
+const allowedOrigins = [
+  process.env.CLIENT_URL,
+  process.env.CLIENT_URLS,
+  "https://fixmate-client24.vercel.app",
+  "https://fixmate-client-wine.vercel.app",
+  "http://localhost:3000",
+]
+  .flatMap((value) => (value || "").split(","))
+  .map((origin) => origin.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+
 app.use(
   cors({
-     origin: process.env.CLIENT_URL || "http://localhost:3000",
-    methods: ["GET", "POST", "PATCH", "DELETE"],
+    origin: (origin, callback) => {
+      // Non-browser requests (server actions, health checks) have no Origin.
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, origin || true);
+      }
+      // Don't throw — that would turn a disallowed browser origin into a
+      // 500. Simply omit the ACAO header so the browser blocks the response.
+      return callback(null, false);
+    },
+    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
@@ -272,19 +316,39 @@ if (!mongoUrl) {
   throw new Error("MONGODB_URL is missing from environment variables");
 }
 
-const client = new MongoClient(mongoUrl);
+// Reuse ONE small pool across warm serverless invocations. A fresh client per
+// invocation (plus the old per-request client in the Next.js role route) is
+// what pushed Atlas to 500/500 connections. Keep the pool tiny on purpose.
+const globalForMongo = globalThis;
+const mongoState =
+  globalForMongo.__fixmateServerMongoState ??
+  (globalForMongo.__fixmateServerMongoState = { client: null, promise: null });
+
+if (!mongoState.client) {
+  mongoState.client = new MongoClient(mongoUrl, {
+    maxPoolSize: 5,
+    minPoolSize: 0,
+    maxIdleTimeMS: 30_000,
+    serverSelectionTimeoutMS: 10_000,
+    waitQueueTimeoutMS: 5_000,
+  });
+}
+const client = mongoState.client;
 
 export async function connectToMongoDB() {
-  try {
-    await client.connect();
-
-    console.log("Successfully connected to MongoDB!");
-
-    return client;
-  } catch (error) {
-    console.error("MongoDB connection failed:", error);
-    throw error;
+  if (!mongoState.promise) {
+    mongoState.promise = client.connect()
+      .then(() => {
+        console.log("Successfully connected to MongoDB!");
+        return client;
+      })
+      .catch((error) => {
+        mongoState.promise = null; // allow a retry on the next invocation
+        console.error("MongoDB connection failed:", error);
+        throw error;
+      });
   }
+  return mongoState.promise;
 }
 
 const connectClient = await connectToMongoDB();
@@ -418,8 +482,26 @@ const verifyAdmin = (req, res, next) => {
   next();
 };
 
-
-
+// Optional auth for the PUBLIC catalogue endpoints. Anonymous callers and
+// customers are allowed through (visibility is then forced in the handler),
+// but a valid token lets admins/technicians see their own listings.
+const optionalAuth = async (req, _res, next) => {
+  const header = req.headers.authorization;
+  if (header?.startsWith("Bearer ")) {
+    try {
+      const { payload } = await jwtVerify(
+        header.split(" ")[1],
+        jwtKey,
+        verifyOptions
+      );
+      const user = await users.findOne({ email: payload.email });
+      if (user) req.user = user;
+    } catch {
+      // Expired/invalid token on a public route: treat as anonymous.
+    }
+  }
+  next();
+};
 
 
 
@@ -483,7 +565,7 @@ app.get("/feature-services", async (req, res) => {
 // Get all services — searching, filtering and sorting happen HERE, in MongoDB.
 // Public browse sends approvalStatus/isAvailable; technician dashboards send
 // technicianEmail/technicianId and deliberately omit those public filters.
-app.get("/services", async (req, res) => {
+app.get("/services", optionalAuth, async (req, res) => {
   try {
     const {
       technicianEmail,
@@ -497,11 +579,35 @@ app.get("/services", async (req, res) => {
     } = req.query;
 
     const query = {};
+    const role = req.user?.role;
+
+    // Public catalogue visibility. Only admins see everything; technicians
+    // see just their own listings (any status) so My Services / edit keep
+    // working. Everyone else — anonymous visitors and customers — can only
+    // ever receive approved AND available services, no matter what query
+    // params they supply.
+    if (role === "technician") {
+      query.technicianEmail = ciExact(req.user.email);
+    } else if (role !== "admin") {
+      query.approvalStatus = "approved";
+      query.isAvailable = true;
+    }
 
     if (technicianEmail) query.technicianEmail = ciExact(technicianEmail);
     if (technicianId) query.technicianId = String(technicianId);
-    if (approvalStatus) query.approvalStatus = String(approvalStatus);
-    if (isAvailable === "true" || isAvailable === true) query.isAvailable = true;
+
+    // Status/availability filters are meaningful only for privileged
+    // callers. Public callers must not be able to widen visibility.
+    if (approvalStatus && (role === "admin" || role === "technician")) {
+      query.approvalStatus = String(approvalStatus);
+    }
+    if (
+      (isAvailable === "true" || isAvailable === true) &&
+      (role === "admin" || role === "technician")
+    ) {
+      query.isAvailable = true;
+    }
+
     if (mode) query.serviceMode = ciExact(mode);
 
     const categoryFilter = category ? categoryMatcher(category) : undefined;
@@ -562,8 +668,47 @@ app.get("/services/categories", async (_req, res) => {
   }
 });
 
-// Update a user's role (admin only).
-app.patch("/users/:id/role",verifyToken, verifyAdmin,  async (req, res) => {
+// Public technician summary for service detail pages. Only non-sensitive
+// profile fields are returned — never email, phone or role-management data.
+app.get("/technicians", async (req, res) => {
+  try {
+    const { id, email } = req.query;
+    if (!id && !email) {
+      return res.status(400).json({ message: "id or email is required." });
+    }
+
+    let query;
+    if (id) {
+      query = ObjectId.isValid(id)
+        ? { $or: [{ _id: new ObjectId(id) }, { _id: String(id) }] }
+        : { _id: String(id) };
+    } else {
+      query = { email: ciExact(email) };
+    }
+
+    const user = await users.findOne(query, {
+      projection: { name: 1, image: 1, area: 1, bio: 1 },
+    });
+    if (!user) {
+      return res.status(404).json({ message: "Technician not found." });
+    }
+
+    res.status(200).json({
+      _id: String(user._id),
+      name: user.name || "",
+      image: user.image || "",
+      area: user.area || "",
+      bio: user.bio || "",
+    });
+  } catch (error) {
+    console.error("Get technician error:", error);
+    res.status(500).json({ message: "Failed to fetch technician." });
+  }
+});
+
+// Update a user's role (admin only). The handler is shared by the bare route
+// and the /admin alias so the /api prefix rewrite cannot bypass the guard.
+async function updateUserRoleHandler(req, res) {
   try {
     const { role } = req.body;
     const { id } = req.params;
@@ -597,11 +742,14 @@ app.patch("/users/:id/role",verifyToken, verifyAdmin,  async (req, res) => {
     console.error("Patch user role error:", err);
     res.status(500).json({ message: "Server error." });
   }
-});
+}
+
+app.patch("/users/:id/role", verifyToken, verifyAdmin, updateUserRoleHandler);
+app.patch("/admin/users/:id/role", verifyToken, verifyAdmin, updateUserRoleHandler);
 
 
 
-app.get("/services/:id", async (req, res) => {
+app.get("/services/:id", optionalAuth, async (req, res) => {
   try {
     const { id } = req.params; // destructure from req.params, not req.params.id
 
@@ -616,6 +764,26 @@ app.get("/services/:id", async (req, res) => {
     const service = await services.findOne({ _id: new ObjectId(id) });
 
     if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    // Hide pending/rejected/unavailable services from public visitors.
+    // Admins may read any service; technicians may read their own (so the
+    // edit form still loads a pending listing).
+    const role = req.user?.role;
+    const ownsIt =
+      role === "technician" &&
+      String(service.technicianEmail || "").toLowerCase() ===
+        String(req.user.email || "").toLowerCase();
+    const publiclyVisible =
+      service.approvalStatus === "approved" &&
+      service.isAvailable !== false &&
+      service.availableForBooking !== false;
+
+    if (role !== "admin" && !ownsIt && !publiclyVisible) {
       return res.status(404).json({
         success: false,
         message: "Service not found",
@@ -909,7 +1077,7 @@ app.delete("/services/:id",verifyToken, verifyTechnician, async (req, res) => {
   }
 });
 
-app.patch("/services/:id/approval", verifyToken, verifyAdmin, async (req, res) => {
+async function updateServiceApprovalHandler(req, res) {
   try {
     const { status } = req.body; // "approved" or "rejected"
     const { id } = req.params;
@@ -931,7 +1099,10 @@ app.patch("/services/:id/approval", verifyToken, verifyAdmin, async (req, res) =
   } catch (err) {
     res.status(500).json({ message: "Server error." });
   }
-});
+}
+
+app.patch("/services/:id/approval", verifyToken, verifyAdmin, updateServiceApprovalHandler);
+app.patch("/admin/services/:id/approval", verifyToken, verifyAdmin, updateServiceApprovalHandler);
 
 
 // Update the signed-in user's own profile. Identity comes from the JWT only —
@@ -965,7 +1136,7 @@ app.patch("/users/profile", verifyToken, async (req, res) => {
 });
 
 // Get all users — private admin data.
-app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
+async function listUsersHandler(_req, res) {
   try {
     const data = await users.find().toArray();
 
@@ -978,7 +1149,10 @@ app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
       message: "Failed to fetch users",
     });
   }
-});
+}
+
+app.get("/users", verifyToken, verifyAdmin, listUsersHandler);
+app.get("/admin/users", verifyToken, verifyAdmin, listUsersHandler);
 
 //booking related api
 
@@ -1197,7 +1371,9 @@ app.post("/bookings",verifyToken, verifyCustomer,async (req, res) => {
     });
 
     if (duplicate) {
-      return res.status(409).json({ message: "Active booking already exists." });
+      return res.status(409).json({
+        message: "You already have an active request for this service.",
+      });
     }
 
     // Older services were saved without technicianEmail - resolve it from the
@@ -1272,10 +1448,12 @@ app.patch("/bookings/:id/cancel", verifyToken, verifyCustomer, async (req, res) 
       return res.status(404).json({ message: "Booking not found." });
     }
 
-    if (!["requested", "accepted", "in-progress"].includes(booking.status)) {
-      return res
-        .status(409)
-        .json({ message: "This booking can no longer be cancelled." });
+    // Business rule: a customer may cancel ONLY while the job is requested.
+    // Once the technician has accepted it, only the technician can move it.
+    if (booking.status !== "requested") {
+      return res.status(409).json({
+        message: "Only a requested booking can be cancelled.",
+      });
     }
 
     await bookings.updateOne(
@@ -1367,11 +1545,12 @@ app.patch("/bookings/:id/status", verifyToken, verifyTechnician, async (req, res
     }
 
     if (status === "completed") {
-      const amt = Number(finalAmount ?? booking.finalAmount ?? booking.basePrice);
+      // Completing a job REQUIRES the technician to send the final amount.
+      const amt = Number(finalAmount);
       if (!Number.isFinite(amt) || amt <= 0) {
-        return res
-          .status(400)
-          .json({ message: "Final amount must be greater than 0." });
+        return res.status(400).json({
+          message: "A final amount greater than 0 is required to complete a job.",
+        });
       }
     }
 
@@ -1380,11 +1559,7 @@ app.patch("/bookings/:id/status", verifyToken, verifyTechnician, async (req, res
       {
         $set: {
           status,
-          ...(status === "completed" && {
-            finalAmount: Number(
-              finalAmount ?? booking.finalAmount ?? booking.basePrice
-            ),
-          }),
+          ...(status === "completed" && { finalAmount: Number(finalAmount) }),
           updatedAt: new Date(),
         },
       }
@@ -1589,12 +1764,14 @@ app.post("/payments/verify", verifyToken, verifyCustomer, async (req, res) => {
     // Idempotency: if this session already created a payment, don't re-settle.
     const existing = await payments.findOne({ stripeSessionId: session.id });
     if (existing) {
+      const receiptUrl = await backfillPaymentReceipt(existing);
       return res.status(200).json({
         paid: true,
         alreadyPaid: true,
         amount: existing.amount,
         transactionId: existing.stripePaymentIntentId || undefined,
         serviceTitle: existing.serviceTitle,
+        receiptUrl: receiptUrl || existing.receiptUrl || undefined,
       });
     }
 
@@ -1617,6 +1794,7 @@ app.post("/payments/verify", verifyToken, verifyCustomer, async (req, res) => {
       bookingId,
       stripeSessionId: session.id,
       stripePaymentIntentId: session.payment_intent || "",
+      transactionId: session.payment_intent || "",
       customerName: booking.customerName,
       customerEmail: booking.customerEmail,
       technicianName: booking.technicianName,
@@ -1646,6 +1824,7 @@ app.post("/payments/verify", verifyToken, verifyCustomer, async (req, res) => {
       // The webhook settled this session first - report the stored payment.
       if (insertErr?.code === 11000) {
         const settled = await payments.findOne({ stripeSessionId: session.id });
+        const receiptUrl = await backfillPaymentReceipt(settled);
         return res.status(200).json({
           paid: true,
           alreadyPaid: true,
@@ -1655,6 +1834,7 @@ app.post("/payments/verify", verifyToken, verifyCustomer, async (req, res) => {
             paymentData.stripePaymentIntentId ||
             undefined,
           serviceTitle: settled?.serviceTitle ?? paymentData.serviceTitle,
+          receiptUrl: receiptUrl || paymentData.receiptUrl || undefined,
         });
       }
       throw insertErr;
@@ -1680,6 +1860,7 @@ app.post("/payments/verify", verifyToken, verifyCustomer, async (req, res) => {
       amount: paymentData.amount,
       transactionId: paymentData.stripePaymentIntentId,
       serviceTitle: paymentData.serviceTitle,
+      receiptUrl: paymentData.receiptUrl || undefined,
     });
   } catch (err) {
     console.error("Verify payment error:", err);
@@ -1782,6 +1963,9 @@ app.get("/payments",verifyToken, verifyCustomer, async (req, res) => {
         stripePaymentIntentId: paid
           ? intentByBooking.get(id) || b.stripePaymentIntentId || undefined
           : undefined,
+        transactionId: paid
+          ? intentByBooking.get(id) || b.stripePaymentIntentId || undefined
+          : undefined,
         paymentMethod: paid ? paymentMethodByBooking.get(id) || undefined : undefined,
         receiptUrl: paid ? receiptByBooking.get(id) || undefined : undefined,
         jobStatus: b.status,
@@ -1860,6 +2044,8 @@ app.get("/admin/payments",  verifyToken, verifyAdmin,
 
             // Real Stripe Payment Intent ID
             stripePaymentIntentId: payment.stripePaymentIntentId || "",
+            transactionId:
+              payment.transactionId || payment.stripePaymentIntentId || "",
 
             // Real Checkout Session ID
             stripeSessionId: payment.stripeSessionId || "",
