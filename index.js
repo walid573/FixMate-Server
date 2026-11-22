@@ -24,6 +24,74 @@ if (!webhookSecret) {
 
 const stripe = new Stripe(stripeSecretKey);
 
+// Helper function to fetch receipt URL from Stripe payment intent
+async function fetchReceiptUrl(stripePaymentIntentId) {
+  if (!stripePaymentIntentId) return null;
+  
+  try {
+    const paymentIntent = await stripe.paymentIntents.retrieve(
+      stripePaymentIntentId,
+      { expand: ["charges"] }
+    );
+    
+    const charge = paymentIntent?.charges?.data?.[0];
+    if (charge?.receipt_url) {
+      return charge.receipt_url;
+    }
+    
+    // If no receipt_url, try to create one by expanding the charge
+    if (charge?.id) {
+      const fullCharge = await stripe.charges.retrieve(charge.id);
+      if (fullCharge?.receipt_url) {
+        return fullCharge.receipt_url;
+      }
+    }
+    
+    return null;
+  } catch (err) {
+    console.error("Failed to fetch receipt URL:", err.message);
+    return null;
+  }
+}
+
+// Helper function to fetch payment method details from Stripe
+async function fetchPaymentMethod(stripePaymentIntentId) {
+  if (!stripePaymentIntentId) return null;
+  
+  try {
+    const paymentIntent = await stripe.paymentIntents.retrieve(
+      stripePaymentIntentId,
+      { expand: ["payment_method", "charges"] }
+    );
+    
+    // Try payment_method first
+    if (paymentIntent?.payment_method) {
+      const pm = paymentIntent.payment_method;
+      if (pm.card) {
+        return {
+          brand: pm.card.brand,
+          last4: pm.card.last4,
+        };
+      }
+    }
+    
+    // Fallback: get from charge
+    const charge = paymentIntent?.charges?.data?.[0];
+    if (charge?.payment_method_details?.card) {
+      const card = charge.payment_method_details.card;
+      return {
+        brand: card.brand,
+        last4: card.last4,
+      };
+    }
+    
+    return null;
+  } catch (err) {
+    console.error("Failed to fetch payment method:", err.message);
+    return null;
+  }
+}
+
 
 
 
@@ -89,6 +157,25 @@ app.post(
           paidAt: new Date(),
           createdAt: new Date(),
         };
+
+        // Try to retrieve receipt URL and payment method from Stripe payment intent
+        if (paymentData.stripePaymentIntentId) {
+          try {
+            paymentData.receiptUrl = await fetchReceiptUrl(
+              paymentData.stripePaymentIntentId
+            );
+          } catch (err) {
+            console.error("Failed to retrieve receipt URL:", err.message);
+          }
+          
+          try {
+            paymentData.paymentMethod = await fetchPaymentMethod(
+              paymentData.stripePaymentIntentId
+            );
+          } catch (err) {
+            console.error("Failed to retrieve payment method:", err.message);
+          }
+        }
 
         // Idempotent payment insertion
         try {
@@ -1406,13 +1493,47 @@ app.get("/payments",verifyToken, verifyCustomer, async (req, res) => {
       .sort({ createdAt: -1 })
       .toArray();
 
-    // Pull the real payment intent IDs from the payments collection
+    // Pull the real payment intent IDs and receipt URLs from the payments collection
     const paymentRecords = await payments
       .find({ bookingId: { $in: docs.map((b) => String(b._id)) } })
       .toArray();
     const intentByBooking = new Map(
       paymentRecords.map((p) => [p.bookingId, p.stripePaymentIntentId])
     );
+    
+    // Build receipt URL and payment method maps, fetching missing ones from Stripe on-demand
+    const receiptByBooking = new Map();
+    const paymentMethodByBooking = new Map();
+    
+    for (const p of paymentRecords) {
+      // Fetch receipt URL if missing
+      if (p.receiptUrl) {
+        receiptByBooking.set(p.bookingId, p.receiptUrl);
+      } else if (p.stripePaymentIntentId) {
+        const receiptUrl = await fetchReceiptUrl(p.stripePaymentIntentId);
+        if (receiptUrl) {
+          receiptByBooking.set(p.bookingId, receiptUrl);
+          await payments.updateOne(
+            { _id: p._id },
+            { $set: { receiptUrl } }
+          );
+        }
+      }
+      
+      // Fetch payment method if missing
+      if (p.paymentMethod) {
+        paymentMethodByBooking.set(p.bookingId, p.paymentMethod);
+      } else if (p.stripePaymentIntentId) {
+        const paymentMethod = await fetchPaymentMethod(p.stripePaymentIntentId);
+        if (paymentMethod) {
+          paymentMethodByBooking.set(p.bookingId, paymentMethod);
+          await payments.updateOne(
+            { _id: p._id },
+            { $set: { paymentMethod } }
+          );
+        }
+      }
+    }
 
     const data = docs.map((b) => {
       const paid = b.paymentStatus === "paid";
@@ -1431,8 +1552,8 @@ app.get("/payments",verifyToken, verifyCustomer, async (req, res) => {
         stripePaymentIntentId: paid
           ? intentByBooking.get(id) || b.stripePaymentIntentId || undefined
           : undefined,
-        paymentMethod: undefined,
-        receiptUrl: undefined,
+        paymentMethod: paid ? paymentMethodByBooking.get(id) || undefined : undefined,
+        receiptUrl: paid ? receiptByBooking.get(id) || undefined : undefined,
         jobStatus: b.status,
         completedAt:
           b.status === "completed" ? (b.updatedAt ?? b.createdAt) : undefined,
@@ -1456,38 +1577,74 @@ app.get("/admin/payments",  verifyToken, verifyAdmin,
         .sort({ paidAt: -1 })
         .toArray();
 
-      const data = paymentDocs.map((payment) => ({
-        _id: String(payment._id),
+      // Fetch missing receipt URLs and payment methods from Stripe on-demand
+      const data = await Promise.all(
+        paymentDocs.map(async (payment) => {
+          let receiptUrl = payment.receiptUrl;
+          let paymentMethod = payment.paymentMethod;
+          
+          // If receipt URL is missing but we have a payment intent, try to fetch it
+          if (!receiptUrl && payment.stripePaymentIntentId) {
+            receiptUrl = await fetchReceiptUrl(payment.stripePaymentIntentId);
+            
+            // Save it to database for future use
+            if (receiptUrl) {
+              await payments.updateOne(
+                { _id: payment._id },
+                { $set: { receiptUrl } }
+              );
+            }
+          }
 
-        bookingId: String(payment.bookingId || ""),
+          // If payment method is missing, try to fetch it from Stripe
+          if (!paymentMethod && payment.stripePaymentIntentId) {
+            paymentMethod = await fetchPaymentMethod(payment.stripePaymentIntentId);
+            
+            // Save it to database for future use
+            if (paymentMethod) {
+              await payments.updateOne(
+                { _id: payment._id },
+                { $set: { paymentMethod } }
+              );
+            }
+          }
 
-        customerName: payment.customerName || "",
-        customerEmail: payment.customerEmail || "",
+          return {
+            _id: String(payment._id),
 
-        technicianName: payment.technicianName || "",
-        technicianEmail: payment.technicianEmail || "",
+            bookingId: String(payment.bookingId || ""),
 
-        serviceTitle: payment.serviceTitle || "",
+            customerName: payment.customerName || "",
+            customerEmail: payment.customerEmail || "",
 
-        amount: Number(payment.amount || 0),
-        currency: payment.currency || "usd",
+            technicianName: payment.technicianName || "",
+            technicianEmail: payment.technicianEmail || "",
 
-        // Frontend-compatible status
-        status: payment.paymentStatus || "pending",
+            serviceTitle: payment.serviceTitle || "",
 
-        // Real Stripe Payment Intent ID
-        stripePaymentIntentId: payment.stripePaymentIntentId || "",
+            amount: Number(payment.amount || 0),
+            currency: payment.currency || "usd",
 
-        // Real Checkout Session ID
-        stripeSessionId: payment.stripeSessionId || "",
+            // Determine status: if paidAt exists or paymentStatus is "paid", it's paid
+            status: payment.paymentStatus === "paid" || payment.paidAt ? "paid" : (payment.paymentStatus || "pending"),
 
-        paidAt: payment.paidAt || null,
-        createdAt: payment.paidAt || null,
+            // Real Stripe Payment Intent ID
+            stripePaymentIntentId: payment.stripePaymentIntentId || "",
 
-        // These aren't stored in your current payment schema
-        paymentMethod: undefined,
-        receiptUrl: undefined,
-      }));
+            // Real Checkout Session ID
+            stripeSessionId: payment.stripeSessionId || "",
+
+            // Payment method details
+            paymentMethod: paymentMethod || undefined,
+
+            paidAt: payment.paidAt || null,
+            createdAt: payment.paidAt || payment.createdAt || null,
+
+            // Return actual receipt URL
+            receiptUrl: receiptUrl || null,
+          };
+        })
+      );
 
       res.status(200).json({
         success: true,
@@ -1505,6 +1662,56 @@ app.get("/admin/payments",  verifyToken, verifyAdmin,
     }
   }
 );
+
+// Endpoint to manually refresh/retry receipt URL for a specific payment
+app.post("/admin/payments/:id/receipt", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid payment id." });
+    }
+
+    const payment = await payments.findOne({ _id: new ObjectId(id) });
+    
+    if (!payment) {
+      return res.status(404).json({ message: "Payment not found." });
+    }
+
+    if (!payment.stripePaymentIntentId) {
+      return res.status(400).json({ message: "No Stripe payment intent ID found." });
+    }
+
+    // Try to fetch receipt URL
+    const receiptUrl = await fetchReceiptUrl(payment.stripePaymentIntentId);
+    
+    if (receiptUrl) {
+      // Save to database
+      await payments.updateOne(
+        { _id: payment._id },
+        { $set: { receiptUrl } }
+      );
+      
+      return res.status(200).json({
+        success: true,
+        receiptUrl,
+        message: "Receipt URL fetched successfully.",
+      });
+    } else {
+      return res.status(404).json({
+        success: false,
+        message: "Receipt URL not available from Stripe yet.",
+      });
+    }
+
+  } catch (error) {
+    console.error("Refresh receipt error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to refresh receipt URL.",
+    });
+  }
+});
 
 
 app.listen(port, () => {
