@@ -824,7 +824,66 @@ app.get("/payments",verifyToken, verifyCustomer, async (req, res) => {
   }
 });
 
+app.get(
+  "/admin/payments",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const paymentDocs = await payments
+        .find({})
+        .sort({ paidAt: -1 })
+        .toArray();
 
+      const data = paymentDocs.map((payment) => ({
+        _id: String(payment._id),
+
+        bookingId: String(payment.bookingId || ""),
+
+        customerName: payment.customerName || "",
+        customerEmail: payment.customerEmail || "",
+
+        technicianName: payment.technicianName || "",
+        technicianEmail: payment.technicianEmail || "",
+
+        serviceTitle: payment.serviceTitle || "",
+
+        amount: Number(payment.amount || 0),
+        currency: payment.currency || "usd",
+
+        // Frontend-compatible status
+        status: payment.paymentStatus || "pending",
+
+        // Real Stripe Payment Intent ID
+        stripePaymentIntentId: payment.transactionId || "",
+
+        // Real Checkout Session ID
+        stripeSessionId: payment.stripeSessionId || "",
+
+        paidAt: payment.paidAt || null,
+        createdAt: payment.paidAt || null,
+
+        // These aren't stored in your current payment schema
+        paymentMethod: undefined,
+        receiptUrl: undefined,
+      }));
+
+      res.status(200).json({
+        success: true,
+        total: data.length,
+        data,
+      });
+
+    } catch (error) {
+      console.error("Admin payments error:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch payment transactions.",
+      });
+    }
+  }
+);
 
 
 app.listen(port, () => {
