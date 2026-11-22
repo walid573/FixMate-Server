@@ -10,7 +10,7 @@ const app = express();
 
 const port = process.env.PORT || 8000;
 
-// Stripe configuration
+
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
@@ -26,6 +26,7 @@ const stripe = new Stripe(stripeSecretKey);
 
 
 
+
 app.post(
   "/webhook/stripe",
   express.raw({ type: "application/json" }),
@@ -33,80 +34,106 @@ app.post(
     const signature = req.headers["stripe-signature"];
 
     let event;
+
     try {
-      event = stripe.webhooks.constructEvent(req.body, signature, webhookSecret);
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        webhookSecret
+      );
     } catch (err) {
-      console.error("Webhook signature error:", err.message);
+      console.error("Stripe signature verification failed:", err.message);
+
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
     try {
-      console.log("Stripe event received:", event.type);
-
       if (event.type === "checkout.session.completed") {
         const session = event.data.object;
+
+        if (session.payment_status !== "paid") {
+          return res.status(200).json({ received: true });
+        }
+
         const bookingId = session.metadata?.bookingId;
 
         if (!bookingId || !ObjectId.isValid(bookingId)) {
-          console.error("No valid bookingId in session metadata");
-          return res.status(200).json({ received: true });
+          console.error("Invalid booking ID:", bookingId);
+          return res.status(400).json({ message: "Invalid booking ID" });
         }
 
-        // Check if already processed (idempotency)
-        const existingPayment = await payments.findOne({ stripeSessionId: session.id });
-        if (existingPayment) {
-          console.log("Payment already processed for session:", session.id);
-          return res.status(200).json({ received: true });
-        }
+        const booking = await bookings.findOne({
+          _id: new ObjectId(bookingId),
+        });
 
-        // Get booking
-        const booking = await bookings.findOne({ _id: new ObjectId(bookingId) });
         if (!booking) {
           console.error("Booking not found:", bookingId);
-          return res.status(200).json({ received: true });
+          return res.status(404).json({ message: "Booking not found" });
         }
 
-        // Create payment record
         const paymentData = {
-          bookingId: bookingId,
+          bookingId: String(booking._id),
           stripeSessionId: session.id,
-          stripePaymentIntentId: session.payment_intent,
-          customerName: booking.customerName,
+          stripePaymentIntentId:
+            typeof session.payment_intent === "string"
+              ? session.payment_intent
+              : "",
+          customerName: booking.customerName || "",
           customerEmail: booking.customerEmail,
-          technicianName: booking.technicianName,
-          technicianEmail: booking.technicianEmail,
+          technicianName: booking.technicianName || "",
+          technicianEmail: booking.technicianEmail || "",
           serviceTitle: booking.serviceTitle,
-          amount: session.amount_total / 100,
-          currency: session.currency,
+          amount: (session.amount_total || 0) / 100,
+          currency: session.currency || "usd",
           paymentStatus: "paid",
           paidAt: new Date(),
           createdAt: new Date(),
         };
 
-        await payments.insertOne(paymentData);
+        // Idempotent payment insertion
+        try {
+          await payments.updateOne(
+            { stripeSessionId: session.id },
+            { $setOnInsert: paymentData },
+            { upsert: true }
+          );
+        } catch (err) {
+          if (err.code !== 11000) throw err;
+        }
 
-        // Update booking payment status
+        // Always synchronize the booking
         await bookings.updateOne(
           { _id: booking._id },
           {
             $set: {
               paymentStatus: "paid",
               paidAt: new Date(),
-              stripeSessionId: session.id
-            }
+              stripeSessionId: session.id,
+              stripePaymentIntentId:
+                paymentData.stripePaymentIntentId,
+              updatedAt: new Date(),
+            },
           }
         );
 
-        console.log("Payment processed successfully for booking:", bookingId);
+        console.log(
+          "Payment successfully processed:",
+          bookingId
+        );
       }
 
       return res.status(200).json({ received: true });
+
     } catch (error) {
-      console.error("Webhook processing error:", error);
-      return res.status(500).json({ message: "Webhook processing failed" });
+      console.error("Webhook processing failed:", error);
+
+      return res.status(500).json({
+        message: "Webhook processing failed",
+      });
     }
   }
 );
+
 
 // Normal JSON middleware AFTER Stripe webhook
 app.use(express.json());
@@ -162,12 +189,28 @@ const payments = db.collection("payments");
 // secret — verifying an HS256 token against a remote JWKS (RS256) always fails
 // with 401, which is what starved every protected endpoint of data.
 const AUTH_URL = process.env.AUTH_URL;
-if (!AUTH_URL) throw new Error("AUTH_URL is missing from .env");
+// AUTH_URL is optional now. Tokens are authenticated by the shared JWT_SECRET
+// (HS256), so a client-URL mismatch can no longer reject every request.
+
+// AUTH_URL may hold several client URLs, comma-separated, e.g.
+// "http://localhost:3000,https://fix-mate-client.vercel.app" - so the same
+// server accepts tokens from both a local and a deployed client.
+const AUTH_URLS = (AUTH_URL || "").split(",")
+  .map((u) => u.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
 
 const jwtSecret = process.env.JWT_SECRET;
 if (!jwtSecret) throw new Error("JWT_SECRET is missing from .env");
 
 const jwtKey = new TextEncoder().encode(jwtSecret);
+
+// Pin the algorithm. Issuer/audience are only enforced if you opt in by setting
+// ENFORCE_TOKEN_ISSUER=true (then AUTH_URL must list every client URL).
+const verifyOptions = { algorithms: ["HS256"] };
+if (process.env.ENFORCE_TOKEN_ISSUER === "true" && AUTH_URLS.length) {
+  verifyOptions.issuer = AUTH_URLS;
+  verifyOptions.audience = AUTH_URLS;
+}
 
 const verifyToken = async (req, res, next) => {
   try {
@@ -176,10 +219,11 @@ const verifyToken = async (req, res, next) => {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
-    const { payload } = await jwtVerify(header.split(" ")[1], jwtKey, {
-      issuer: AUTH_URL,
-      audience: AUTH_URL,
-    });
+    const { payload } = await jwtVerify(
+      header.split(" ")[1],
+      jwtKey,
+      verifyOptions
+    );
 
     // Take the role from the DB, not the token, so role changes apply instantly
     const user = await users.findOne({ email: payload.email });
@@ -187,7 +231,8 @@ const verifyToken = async (req, res, next) => {
 
     req.user = user;
     next();
-  } catch {
+  } catch (err) {
+    console.error("verifyToken rejected a request:", err?.code || err?.message);
     res.status(401).json({ message: "Unauthorized" });
   }
 };
@@ -290,8 +335,13 @@ app.get("/feature-services", async (req, res) => {
 // Get all services
 app.get("/services", async (req, res) => {
   try {
+    const { technicianEmail, technicianId } = req.query;
+    const query = {};
+    if (technicianEmail) query.technicianEmail = technicianEmail;
+    if (technicianId) query.technicianId = technicianId;
+
     const data = await services
-      .find()
+      .find(query)
       .sort({ createdAt: -1 })
       .toArray();
 
@@ -444,6 +494,7 @@ app.post("/services",verifyToken, verifyTechnician, async (req, res) => {
   serviceMode,
   technicianName: technicianName.trim(),
   technicianId,
+  technicianEmail: req.user.email,
   image: image?.trim() || "",
   availableForBooking: availableForBooking ?? true,
   isAvailable: availableForBooking ?? true,
@@ -681,12 +732,89 @@ app.get("/bookings",verifyToken, async (req, res) => {
         .json({ message: "Either email or technicianEmail is required." });
     }
 
+    // Callers may only list their own bookings (admins can list any).
+    const callerEmail = String(req.user.email).toLowerCase();
+    const requestedEmail = String(email || technicianEmail).toLowerCase();
+    if (req.user.role !== "admin" && requestedEmail !== callerEmail) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
     const bookings = db.collection("bookings");
-    const query = email
-      ? { customerEmail: email }
-      : { technicianEmail };
+
+    // Escape for a case-insensitive anchored regex match (MongoDB text fields
+    // are case-sensitive by default, so we match ignoring email casing).
+    const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const ciMatch = (value) => ({
+      $regex: `^${escapeRegex(value)}$`,
+      $options: "i",
+    });
+
+    const rawEmail = email ? String(email) : undefined;
+    const rawTechnicianEmail = technicianEmail ? String(technicianEmail) : undefined;
+
+    // Resolve bookings whose technicianEmail is null by joining through the
+    // service -> technician user record. Older bookings were saved without an
+    // email when the service lacked technicianEmail/technicianId.
+    let query;
+    if (rawTechnicianEmail && !rawEmail) {
+      const techServices = await services
+        .find({
+          $or: [
+            { technicianEmail: ciMatch(rawTechnicianEmail) },
+            { technicianId: null }, // handled below per-booking if needed
+          ],
+        })
+        .project({ _id: 1, technicianEmail: 1 })
+        .toArray();
+
+      const techServiceIds = techServices.map((s) => s._id);
+
+      query = {
+        $or: [
+          { technicianEmail: ciMatch(rawTechnicianEmail) },
+          {
+            technicianEmail: null,
+            serviceId: { $in: techServiceIds },
+          },
+        ],
+      };
+    } else if (rawEmail) {
+      query = { customerEmail: ciMatch(rawEmail) };
+    } else {
+      return res
+        .status(400)
+        .json({ message: "Either email or technicianEmail is required." });
+    }
 
     const data = await bookings.find(query).sort({ createdAt: -1 }).toArray();
+
+    // Backfill null technicianEmail on bookings belonging to this technician
+    // so subsequent status updates (which key off technicianEmail) work.
+    if (rawTechnicianEmail) {
+      const callerLower = String(rawTechnicianEmail).toLowerCase();
+      for (const b of data) {
+        if (!b.technicianEmail && b.serviceId) {
+          const svc = await services.findOne({ _id: b.serviceId }).project({
+            technicianId: 1,
+            technicianEmail: 1,
+          });
+          let resolvedEmail = svc?.technicianEmail;
+          if (!resolvedEmail && svc?.technicianId) {
+            const tech = await users
+              .findOne({ _id: svc.technicianId })
+              .project({ email: 1 });
+            resolvedEmail = tech?.email;
+          }
+          if (resolvedEmail && String(resolvedEmail).toLowerCase() === callerLower) {
+            await bookings.updateOne(
+              { _id: b._id },
+              { $set: { technicianEmail: resolvedEmail } }
+            );
+            b.technicianEmail = resolvedEmail;
+          }
+        }
+      }
+    }
 
     res.status(200).json(data);
   } catch (err) {
@@ -761,6 +889,31 @@ app.post("/bookings",verifyToken, verifyCustomer,async (req, res) => {
       return res.status(409).json({ message: "Active booking already exists." });
     }
 
+    // Older services were saved without technicianEmail - resolve it from the
+    // technician's user record so the technician still receives the request.
+    let technicianEmail = service.technicianEmail;
+    if (!technicianEmail && ObjectId.isValid(service.technicianId)) {
+      const tech = await users.findOne({
+        _id: new ObjectId(service.technicianId),
+      });
+      technicianEmail = tech?.email;
+    }
+    
+    // Ensure we always have a technicianEmail - if null, try to resolve via serviceId
+    if (!technicianEmail && service.technicianId) {
+      const tech = await users.findOne({
+        _id: new ObjectId(service.technicianId),
+      });
+      technicianEmail = tech?.email;
+    }
+    
+    // Ensure we have a technicianEmail before creating the booking
+    if (!technicianEmail) {
+      return res.status(400).json({ 
+        message: "Technician email is required to create a booking" 
+      });
+    }
+
     const result = await bookings.insertOne({
       serviceId: b.serviceId,
       serviceTitle: service.title,
@@ -768,7 +921,7 @@ app.post("/bookings",verifyToken, verifyCustomer,async (req, res) => {
       category: service.category,
       basePrice: service.basePrice,
       technicianName: service.technicianName,
-      technicianEmail: service.technicianEmail,
+      technicianEmail,
       customerName: b.customerName,
       customerEmail: b.customerEmail,
       customerPhone: b.customerPhone.trim(),
@@ -815,10 +968,66 @@ app.patch("/bookings/:id/status",verifyToken, async (req, res) => {
         .json({ message: "Either customerEmail or technicianEmail is required." });
     }
 
+    // The caller must really be the party they claim to be.
+    const me = String(req.user.email).toLowerCase();
+    if (
+      (customerEmail && String(customerEmail).toLowerCase() !== me) ||
+      (technicianEmail && String(technicianEmail).toLowerCase() !== me)
+    ) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    // Technicians move jobs forward; customers can only cancel their own.
+    const TECHNICIAN_STATUSES = ["accepted", "in-progress", "completed", "rejected"];
+    if (
+      technicianEmail
+        ? !TECHNICIAN_STATUSES.includes(status)
+        : status !== "cancelled"
+    ) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    if (finalAmount !== undefined) {
+      const amt = Number(finalAmount);
+      if (!Number.isFinite(amt) || amt <= 0) {
+        return res
+          .status(400)
+          .json({ message: "Final amount must be greater than 0." });
+      }
+    }
+
     // Ownership check — the caller must be one of the two parties.
+    // For technicians, we need to handle the case where booking.technicianEmail is null
+    // by resolving it from the service's technicianId
+    let finalTechnicianEmail = technicianEmail;
+    if (technicianEmail) {
+      // First check if the booking actually has this technicianEmail or null
+      const bookingDoc = await bookings.findOne({
+        _id: new ObjectId(req.params.id),
+        projection: { technicianEmail: 1, serviceId: 1 }
+      });
+      
+      if (bookingDoc) {
+        if (!bookingDoc.technicianEmail && bookingDoc.serviceId) {
+          // Booking has null technicianEmail - resolve from service
+          const serviceDoc = await db.collection("services").findOne({
+            _id: bookingDoc.serviceId
+          });
+          if (serviceDoc?.technicianId) {
+            const tech = await users.findOne({
+              _id: new ObjectId(serviceDoc.technicianId)
+            });
+            if (tech?.email && String(tech.email).toLowerCase() === me) {
+              finalTechnicianEmail = tech.email;
+            }
+          }
+        }
+      }
+    }
+
     const ownerQuery = {};
     if (customerEmail) ownerQuery.customerEmail = customerEmail;
-    if (technicianEmail) ownerQuery.technicianEmail = technicianEmail;
+    if (finalTechnicianEmail) ownerQuery.technicianEmail = finalTechnicianEmail;
 
     const booking = await bookings.findOne({
       _id: new ObjectId(req.params.id),
@@ -858,7 +1067,9 @@ app.patch("/bookings/:id/status",verifyToken, async (req, res) => {
           // `finalAmount` is OPTIONAL — only meaningful when completing a job
           // (the technician sets the final price). Ignored for every other
           // transition so the existing basePrice is preserved.
-          ...(finalAmount !== undefined && { finalAmount }),
+          ...(technicianEmail &&
+            status === "completed" &&
+            finalAmount !== undefined && { finalAmount: Number(finalAmount) }),
           updatedAt: new Date(),
         },
       }
@@ -870,6 +1081,79 @@ app.patch("/bookings/:id/status",verifyToken, async (req, res) => {
     res.status(500).json({ message: "Server error." });
   }
 });
+
+// Technician corrects the final price of a completed, still-unpaid job.
+app.patch(
+  "/bookings/:id/final-amount",
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      if (!ObjectId.isValid(req.params.id)) {
+        return res.status(400).json({ message: "Invalid booking id." });
+      }
+
+      const amount = Number(req.body.finalAmount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res
+          .status(400)
+          .json({ message: "Final amount must be greater than 0." });
+      }
+
+      // Handle bookings with null technicianEmail by resolving from service
+      let booking = await bookings.findOne({
+        _id: new ObjectId(req.params.id),
+        technicianEmail: req.user.email,
+      });
+
+      // If not found and technicianEmail is null, try to resolve via service
+      if (!booking) {
+        const bookingDoc = await bookings.findOne({
+          _id: new ObjectId(req.params.id),
+          projection: { technicianEmail: 1, serviceId: 1, status: 1, paymentStatus: 1 }
+        });
+        
+        if (bookingDoc && !bookingDoc.technicianEmail && bookingDoc.serviceId) {
+          const serviceDoc = await db.collection("services").findOne({
+            _id: bookingDoc.serviceId
+          });
+          if (serviceDoc?.technicianId) {
+            const tech = await users.findOne({
+              _id: new ObjectId(serviceDoc.technicianId)
+            });
+            if (tech?.email && String(tech.email).toLowerCase() === String(req.user.email).toLowerCase()) {
+              booking = bookingDoc;
+            }
+          }
+        }
+      }
+
+      if (!booking) {
+        return res.status(404).json({ message: "Booking not found." });
+      }
+      if (booking.status !== "completed") {
+        return res
+          .status(409)
+          .json({ message: "Only a completed job's amount can be edited." });
+      }
+      if (booking.paymentStatus === "paid") {
+        return res
+          .status(409)
+          .json({ message: "This job is already paid and can't be changed." });
+      }
+
+      await bookings.updateOne(
+        { _id: booking._id },
+        { $set: { finalAmount: amount, updatedAt: new Date() } }
+      );
+
+      res.status(200).json({ ...booking, finalAmount: amount });
+    } catch (err) {
+      console.error("Update final amount error:", err);
+      res.status(500).json({ message: "Server error." });
+    }
+  }
+);
 
 app.delete('/bookings/:id', async(req,res)=>{
 
@@ -992,7 +1276,25 @@ app.post("/payments/verify", verifyToken, verifyCustomer, async (req, res) => {
       createdAt: new Date(),
     };
 
-    await payments.insertOne(paymentData);
+    try {
+      await payments.insertOne(paymentData);
+    } catch (insertErr) {
+      // The webhook settled this session first - report the stored payment.
+      if (insertErr?.code === 11000) {
+        const settled = await payments.findOne({ stripeSessionId: session.id });
+        return res.status(200).json({
+          paid: true,
+          alreadyPaid: true,
+          amount: settled?.amount ?? paymentData.amount,
+          transactionId:
+            settled?.stripePaymentIntentId ||
+            paymentData.stripePaymentIntentId ||
+            undefined,
+          serviceTitle: settled?.serviceTitle ?? paymentData.serviceTitle,
+        });
+      }
+      throw insertErr;
+    }
 
     await bookings.updateOne(
       { _id: booking._id },
@@ -1001,6 +1303,7 @@ app.post("/payments/verify", verifyToken, verifyCustomer, async (req, res) => {
           paymentStatus: "paid",
           paidAt: new Date(),
           stripeSessionId: session.id,
+          stripePaymentIntentId: paymentData.stripePaymentIntentId,
           updatedAt: new Date(),
         },
       }
@@ -1029,12 +1332,25 @@ app.get("/payments",verifyToken, verifyCustomer, async (req, res) => {
       return res.status(400).json({ message: "Email is required." });
     }
 
+    // A customer may only read their own payments.
+    if (String(email).toLowerCase() !== String(req.user.email).toLowerCase()) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
     
 
     const docs = await bookings
       .find({ customerEmail: email, status: { $nin: ["cancelled", "rejected"] } })
       .sort({ createdAt: -1 })
       .toArray();
+
+    // Pull the real payment intent IDs from the payments collection
+    const paymentRecords = await payments
+      .find({ bookingId: { $in: docs.map((b) => String(b._id)) } })
+      .toArray();
+    const intentByBooking = new Map(
+      paymentRecords.map((p) => [p.bookingId, p.stripePaymentIntentId])
+    );
 
     const data = docs.map((b) => {
       const paid = b.paymentStatus === "paid";
@@ -1050,7 +1366,9 @@ app.get("/payments",verifyToken, verifyCustomer, async (req, res) => {
         currency: "usd",
         status: paid ? "paid" : "pending",
       
-        stripePaymentIntentId: paid ? (b.stripePaymentIntentId || undefined) : undefined,
+        stripePaymentIntentId: paid
+          ? intentByBooking.get(id) || b.stripePaymentIntentId || undefined
+          : undefined,
         paymentMethod: undefined,
         receiptUrl: undefined,
         jobStatus: b.status,
@@ -1068,9 +1386,7 @@ app.get("/payments",verifyToken, verifyCustomer, async (req, res) => {
   }
 });
 
-app.get(
-  "/admin/payments",
-  verifyToken, verifyAdmin,
+app.get("/admin/payments",  verifyToken, verifyAdmin,
   async (req, res) => {
     try {
       const paymentDocs = await payments
@@ -1098,7 +1414,7 @@ app.get(
         status: payment.paymentStatus || "pending",
 
         // Real Stripe Payment Intent ID
-        stripePaymentIntentId: payment.transactionId || "",
+        stripePaymentIntentId: payment.stripePaymentIntentId || "",
 
         // Real Checkout Session ID
         stripeSessionId: payment.stripeSessionId || "",
