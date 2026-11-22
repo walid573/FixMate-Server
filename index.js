@@ -337,7 +337,15 @@ app.get("/services", async (req, res) => {
   try {
     const { technicianEmail, technicianId } = req.query;
     const query = {};
-    if (technicianEmail) query.technicianEmail = technicianEmail;
+    
+    // Case-insensitive email matching
+    if (technicianEmail) {
+      const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      query.technicianEmail = {
+        $regex: `^${escapeRegex(technicianEmail)}$`,
+        $options: "i",
+      };
+    }
     if (technicianId) query.technicianId = technicianId;
 
     const data = await services
@@ -533,9 +541,14 @@ app.patch("/services",verifyToken, verifyTechnician, async (req, res) => {
       return res.status(400).json({ message: "Technician id is required." });
     }
 
+    // Find service owned by this technician (match by technicianId OR technicianEmail)
     const service = await services.findOne({
       _id: new ObjectId(id),
-      technicianId,
+      $or: [
+        { technicianId },
+        { technicianId: String(req.user._id) },
+        { technicianEmail: req.user.email },
+      ],
     });
 
     if (!service) {
@@ -638,6 +651,11 @@ app.patch("/services",verifyToken, verifyTechnician, async (req, res) => {
       return res.status(400).json({ message: "Nothing to update." });
     }
 
+    // Backfill technicianEmail if missing (for older services)
+    if (!service.technicianEmail && req.user.email) {
+      $set.technicianEmail = req.user.email;
+    }
+
     await services.updateOne({ _id: service._id }, { $set });
 
     res.status(200).json({ ...service, ...$set });
@@ -660,9 +678,14 @@ app.delete("/services/:id",verifyToken, verifyTechnician, async (req, res) => {
       return res.status(400).json({ message: "Technician id is required." });
     }
 
+    // Find service owned by this technician (match by technicianId OR technicianEmail)
     const service = await services.findOne({
       _id: new ObjectId(req.params.id),
-      technicianId,
+      $or: [
+        { technicianId },
+        { technicianId: String(req.user._id) },
+        { technicianEmail: req.user.email },
+      ],
     });
 
     if (!service) {
@@ -757,17 +780,21 @@ app.get("/bookings",verifyToken, async (req, res) => {
     // email when the service lacked technicianEmail/technicianId.
     let query;
     if (rawTechnicianEmail && !rawEmail) {
+      // Find all services that belong to this technician, either by
+      // technicianEmail or by technicianId matching the caller's user id.
       const techServices = await services
         .find({
           $or: [
             { technicianEmail: ciMatch(rawTechnicianEmail) },
-            { technicianId: null }, // handled below per-booking if needed
+            { technicianId: String(req.user._id) },
+            { technicianId: req.user._id },
           ],
         })
-        .project({ _id: 1, technicianEmail: 1 })
+        .project({ _id: 1 })
         .toArray();
 
-      const techServiceIds = techServices.map((s) => s._id);
+      // serviceId in bookings is stored as a string, so convert to strings
+      const techServiceIds = techServices.map((s) => String(s._id));
 
       query = {
         $or: [
@@ -794,15 +821,29 @@ app.get("/bookings",verifyToken, async (req, res) => {
       const callerLower = String(rawTechnicianEmail).toLowerCase();
       for (const b of data) {
         if (!b.technicianEmail && b.serviceId) {
-          const svc = await services.findOne({ _id: b.serviceId }).project({
+          // serviceId in bookings is stored as a string, convert to ObjectId
+          let svcId = b.serviceId;
+          if (typeof svcId === "string" && ObjectId.isValid(svcId)) {
+            svcId = new ObjectId(svcId);
+          }
+          const svc = await services.findOne({ _id: svcId }).project({
             technicianId: 1,
             technicianEmail: 1,
           });
           let resolvedEmail = svc?.technicianEmail;
           if (!resolvedEmail && svc?.technicianId) {
-            const tech = await users
-              .findOne({ _id: svc.technicianId })
-              .project({ email: 1 });
+            // technicianId may be a string (better-auth) or ObjectId
+            let tech = null;
+            if (ObjectId.isValid(svc.technicianId)) {
+              tech = await users
+                .findOne({ _id: new ObjectId(svc.technicianId) })
+                .project({ email: 1 });
+            }
+            if (!tech) {
+              tech = await users
+                .findOne({ _id: svc.technicianId })
+                .project({ email: 1 });
+            }
             resolvedEmail = tech?.email;
           }
           if (resolvedEmail && String(resolvedEmail).toLowerCase() === callerLower) {
@@ -861,6 +902,10 @@ app.post("/bookings",verifyToken, verifyCustomer,async (req, res) => {
       return res.status(400).json({ message: "Invalid or missing fields." });
     }
 
+    if (!ObjectId.isValid(b.serviceId)) {
+      return res.status(400).json({ message: "Invalid service id." });
+    }
+
     const date = new Date(b.preferredDate);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -892,18 +937,21 @@ app.post("/bookings",verifyToken, verifyCustomer,async (req, res) => {
     // Older services were saved without technicianEmail - resolve it from the
     // technician's user record so the technician still receives the request.
     let technicianEmail = service.technicianEmail;
-    if (!technicianEmail && ObjectId.isValid(service.technicianId)) {
-      const tech = await users.findOne({
-        _id: new ObjectId(service.technicianId),
-      });
-      technicianEmail = tech?.email;
-    }
     
-    // Ensure we always have a technicianEmail - if null, try to resolve via serviceId
+    // If no technicianEmail on service, try to resolve it from technicianId
     if (!technicianEmail && service.technicianId) {
-      const tech = await users.findOne({
-        _id: new ObjectId(service.technicianId),
-      });
+      // technicianId may be a string (better-auth) or ObjectId
+      let tech = null;
+      if (ObjectId.isValid(service.technicianId)) {
+        tech = await users.findOne({
+          _id: new ObjectId(service.technicianId),
+        });
+      }
+      if (!tech) {
+        tech = await users.findOne({
+          _id: service.technicianId,
+        });
+      }
       technicianEmail = tech?.email;
     }
     
@@ -1010,13 +1058,27 @@ app.patch("/bookings/:id/status",verifyToken, async (req, res) => {
       if (bookingDoc) {
         if (!bookingDoc.technicianEmail && bookingDoc.serviceId) {
           // Booking has null technicianEmail - resolve from service
+          // serviceId in bookings is stored as a string, convert to ObjectId
+          let svcId = bookingDoc.serviceId;
+          if (typeof svcId === "string" && ObjectId.isValid(svcId)) {
+            svcId = new ObjectId(svcId);
+          }
           const serviceDoc = await db.collection("services").findOne({
-            _id: bookingDoc.serviceId
+            _id: svcId
           });
           if (serviceDoc?.technicianId) {
-            const tech = await users.findOne({
-              _id: new ObjectId(serviceDoc.technicianId)
-            });
+            // technicianId may be a string (better-auth) or ObjectId
+            let tech = null;
+            if (ObjectId.isValid(serviceDoc.technicianId)) {
+              tech = await users.findOne({
+                _id: new ObjectId(serviceDoc.technicianId)
+              });
+            }
+            if (!tech) {
+              tech = await users.findOne({
+                _id: serviceDoc.technicianId
+              });
+            }
             if (tech?.email && String(tech.email).toLowerCase() === me) {
               finalTechnicianEmail = tech.email;
             }
