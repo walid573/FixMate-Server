@@ -3,13 +3,112 @@ import cors from "cors";
 import "dotenv/config";
 import { MongoClient, ObjectId } from "mongodb";
 import Stripe from "stripe";
-import { jwtVerify, createRemoteJWKSet } from "jose";
+import { jwtVerify } from "jose";
 
 
 const app = express();
 
 const port = process.env.PORT || 8000;
 
+// Stripe configuration
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
+const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+if (!stripeSecretKey) {
+  throw new Error("STRIPE_SECRET_KEY is missing");
+}
+
+if (!webhookSecret) {
+  throw new Error("STRIPE_WEBHOOK_SECRET is missing");
+}
+
+const stripe = new Stripe(stripeSecretKey);
+
+
+
+app.post(
+  "/webhook/stripe",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const signature = req.headers["stripe-signature"];
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, signature, webhookSecret);
+    } catch (err) {
+      console.error("Webhook signature error:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+      console.log("Stripe event received:", event.type);
+
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object;
+        const bookingId = session.metadata?.bookingId;
+
+        if (!bookingId || !ObjectId.isValid(bookingId)) {
+          console.error("No valid bookingId in session metadata");
+          return res.status(200).json({ received: true });
+        }
+
+        // Check if already processed (idempotency)
+        const existingPayment = await payments.findOne({ stripeSessionId: session.id });
+        if (existingPayment) {
+          console.log("Payment already processed for session:", session.id);
+          return res.status(200).json({ received: true });
+        }
+
+        // Get booking
+        const booking = await bookings.findOne({ _id: new ObjectId(bookingId) });
+        if (!booking) {
+          console.error("Booking not found:", bookingId);
+          return res.status(200).json({ received: true });
+        }
+
+        // Create payment record
+        const paymentData = {
+          bookingId: bookingId,
+          stripeSessionId: session.id,
+          stripePaymentIntentId: session.payment_intent,
+          customerName: booking.customerName,
+          customerEmail: booking.customerEmail,
+          technicianName: booking.technicianName,
+          technicianEmail: booking.technicianEmail,
+          serviceTitle: booking.serviceTitle,
+          amount: session.amount_total / 100,
+          currency: session.currency,
+          paymentStatus: "paid",
+          paidAt: new Date(),
+          createdAt: new Date(),
+        };
+
+        await payments.insertOne(paymentData);
+
+        // Update booking payment status
+        await bookings.updateOne(
+          { _id: booking._id },
+          {
+            $set: {
+              paymentStatus: "paid",
+              paidAt: new Date(),
+              stripeSessionId: session.id
+            }
+          }
+        );
+
+        console.log("Payment processed successfully for booking:", bookingId);
+      }
+
+      return res.status(200).json({ received: true });
+    } catch (error) {
+      console.error("Webhook processing error:", error);
+      return res.status(500).json({ message: "Webhook processing failed" });
+    }
+  }
+);
+
+// Normal JSON middleware AFTER Stripe webhook
 app.use(express.json());
 
 app.use(
@@ -19,11 +118,6 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
-
-if (!stripeSecretKey) {
-  throw new Error("STRIPE_SECRET_KEY is missing from .env");
-}
 
 // MongoDB connection
 const mongoUrl = process.env.MONGODB_URL;
@@ -62,11 +156,18 @@ const payments = db.collection("payments");
 
 
 // 1. Verify authentication token
-
+//
+// The Next.js better-auth config signs the JWT with HS256 using the shared
+// JWT_SECRET (see src/lib/auth.ts). We must verify with the SAME algorithm and
+// secret — verifying an HS256 token against a remote JWKS (RS256) always fails
+// with 401, which is what starved every protected endpoint of data.
 const AUTH_URL = process.env.AUTH_URL;
 if (!AUTH_URL) throw new Error("AUTH_URL is missing from .env");
 
-const JWKS = createRemoteJWKSet(new URL(`${AUTH_URL}/api/auth/jwks`));
+const jwtSecret = process.env.JWT_SECRET;
+if (!jwtSecret) throw new Error("JWT_SECRET is missing from .env");
+
+const jwtKey = new TextEncoder().encode(jwtSecret);
 
 const verifyToken = async (req, res, next) => {
   try {
@@ -75,7 +176,7 @@ const verifyToken = async (req, res, next) => {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
-    const { payload } = await jwtVerify(header.split(" ")[1], JWKS, {
+    const { payload } = await jwtVerify(header.split(" ")[1], jwtKey, {
       issuer: AUTH_URL,
       audience: AUTH_URL,
     });
@@ -593,7 +694,7 @@ app.get("/bookings",verifyToken, async (req, res) => {
   }
 });
 
-app.get("/admin/bookings", async (req, res) => {
+app.get("/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
   try {
    
 
@@ -777,6 +878,149 @@ app.delete('/bookings/:id', async(req,res)=>{
 //Payment related API's
 
 
+// Create Stripe Checkout Session
+app.post("/payments/create-checkout-session", verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const { bookingId } = req.body;
+
+    if (!ObjectId.isValid(bookingId)) {
+      return res.status(400).json({ message: "Invalid booking ID" });
+    }
+
+    const booking = await bookings.findOne({
+      _id: new ObjectId(bookingId),
+      customerEmail: req.user.email
+    });
+
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+
+    if (booking.paymentStatus === "paid") {
+      return res.status(400).json({ message: "Already paid" });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      line_items: [{
+        price_data: {
+          currency: "usd",
+          product_data: {
+            name: booking.serviceTitle,
+            description: `Service by ${booking.technicianName}`,
+          },
+          unit_amount: Math.round((booking.finalAmount || booking.basePrice) * 100),
+        },
+        quantity: 1,
+      }],
+      mode: "payment",
+      success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
+      metadata: {
+        bookingId: bookingId,
+        customerEmail: booking.customerEmail,
+      },
+    });
+
+    // Store the session ID for webhook reference
+    await bookings.updateOne(
+      { _id: booking._id },
+      { $set: { stripeSessionId: session.id } }
+    );
+
+    res.json({ sessionId: session.id, url: session.url });
+  } catch (err) {
+    console.error("Create checkout session error:", err);
+    res.status(500).json({ message: "Failed to create payment session" });
+  }
+});
+
+
+// Settle a payment after the customer returns from Stripe Checkout.
+// This is the browser-redirect path (the webhook is the server-side path);
+// it is idempotent, so refreshing the success page never double-charges.
+app.post("/payments/verify", verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+
+    if (!sessionId) {
+      return res.status(400).json({ message: "sessionId is required." });
+    }
+
+    // Retrieve the live Checkout Session from Stripe
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    if (session.payment_status !== "paid") {
+      return res.status(200).json({ paid: false });
+    }
+
+    const bookingId = session.metadata?.bookingId;
+
+    if (!bookingId || !ObjectId.isValid(bookingId)) {
+      return res.status(400).json({ message: "No valid bookingId on session." });
+    }
+
+    // Idempotency: if this session already created a payment, don't re-settle.
+    const existing = await payments.findOne({ stripeSessionId: session.id });
+    if (existing) {
+      return res.status(200).json({
+        paid: true,
+        alreadyPaid: true,
+        amount: existing.amount,
+        transactionId: existing.stripePaymentIntentId || undefined,
+        serviceTitle: existing.serviceTitle,
+      });
+    }
+
+    const booking = await bookings.findOne({ _id: new ObjectId(bookingId) });
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found." });
+    }
+
+    const paymentData = {
+      bookingId,
+      stripeSessionId: session.id,
+      stripePaymentIntentId: session.payment_intent || "",
+      customerName: booking.customerName,
+      customerEmail: booking.customerEmail,
+      technicianName: booking.technicianName,
+      technicianEmail: booking.technicianEmail,
+      serviceTitle: booking.serviceTitle,
+      amount: (session.amount_total ?? 0) / 100,
+      currency: session.currency || "usd",
+      paymentStatus: "paid",
+      paidAt: new Date(),
+      createdAt: new Date(),
+    };
+
+    await payments.insertOne(paymentData);
+
+    await bookings.updateOne(
+      { _id: booking._id },
+      {
+        $set: {
+          paymentStatus: "paid",
+          paidAt: new Date(),
+          stripeSessionId: session.id,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    console.log("Payment settled via /payments/verify for booking:", bookingId);
+
+    return res.status(200).json({
+      paid: true,
+      amount: paymentData.amount,
+      transactionId: paymentData.stripePaymentIntentId,
+      serviceTitle: paymentData.serviceTitle,
+    });
+  } catch (err) {
+    console.error("Verify payment error:", err);
+    res.status(500).json({ message: "Failed to verify payment." });
+  }
+});
+
+
 app.get("/payments",verifyToken, verifyCustomer, async (req, res) => {
   try {
     const { email } = req.query;
@@ -806,8 +1050,8 @@ app.get("/payments",verifyToken, verifyCustomer, async (req, res) => {
         currency: "usd",
         status: paid ? "paid" : "pending",
       
-        stripePaymentIntentId: paid ? mockPaymentIntentId(id) : undefined,
-        paymentMethod: paid ? mockPaymentMethod(id) : undefined,
+        stripePaymentIntentId: paid ? (b.stripePaymentIntentId || undefined) : undefined,
+        paymentMethod: undefined,
         receiptUrl: undefined,
         jobStatus: b.status,
         completedAt:
@@ -826,8 +1070,7 @@ app.get("/payments",verifyToken, verifyCustomer, async (req, res) => {
 
 app.get(
   "/admin/payments",
-  verifyToken,
-  verifyAdmin,
+  verifyToken, verifyAdmin,
   async (req, res) => {
     try {
       const paymentDocs = await payments
