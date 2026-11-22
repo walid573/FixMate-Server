@@ -24,29 +24,36 @@ if (!webhookSecret) {
 
 const stripe = new Stripe(stripeSecretKey);
 
-// Helper function to fetch receipt URL from Stripe payment intent
+// Helper function to fetch receipt URL from Stripe payment intent.
+// IMPORTANT: stripe-node v23 / the current Stripe API removed the
+// PaymentIntent.charges list. Expanding "charges" silently returned nothing,
+// so receipt_url was ALWAYS null. The correct field is "latest_charge".
 async function fetchReceiptUrl(stripePaymentIntentId) {
   if (!stripePaymentIntentId) return null;
-  
+
   try {
     const paymentIntent = await stripe.paymentIntents.retrieve(
       stripePaymentIntentId,
-      { expand: ["charges"] }
+      { expand: ["latest_charge"] }
     );
-    
-    const charge = paymentIntent?.charges?.data?.[0];
-    if (charge?.receipt_url) {
-      return charge.receipt_url;
+
+    let charge = paymentIntent?.latest_charge;
+    if (typeof charge === "string") {
+      charge = await stripe.charges.retrieve(charge);
     }
-    
-    // If no receipt_url, try to create one by expanding the charge
-    if (charge?.id) {
-      const fullCharge = await stripe.charges.retrieve(charge.id);
-      if (fullCharge?.receipt_url) {
-        return fullCharge.receipt_url;
-      }
+    if (charge?.receipt_url) return charge.receipt_url;
+
+    // Fallback for intents where latest_charge is missing.
+    const list = await stripe.charges.list({
+      payment_intent: stripePaymentIntentId,
+      limit: 1,
+    });
+    const first = list?.data?.[0];
+    if (first?.receipt_url) return first.receipt_url;
+    if (first?.id) {
+      const fullCharge = await stripe.charges.retrieve(first.id);
+      return fullCharge?.receipt_url || null;
     }
-    
     return null;
   } catch (err) {
     console.error("Failed to fetch receipt URL:", err.message);
@@ -57,34 +64,27 @@ async function fetchReceiptUrl(stripePaymentIntentId) {
 // Helper function to fetch payment method details from Stripe
 async function fetchPaymentMethod(stripePaymentIntentId) {
   if (!stripePaymentIntentId) return null;
-  
+
   try {
     const paymentIntent = await stripe.paymentIntents.retrieve(
       stripePaymentIntentId,
-      { expand: ["payment_method", "charges"] }
+      { expand: ["payment_method", "latest_charge"] }
     );
-    
+
     // Try payment_method first
-    if (paymentIntent?.payment_method) {
-      const pm = paymentIntent.payment_method;
-      if (pm.card) {
-        return {
-          brand: pm.card.brand,
-          last4: pm.card.last4,
-        };
-      }
+    const pm = paymentIntent?.payment_method;
+    if (pm && typeof pm !== "string" && pm.card) {
+      return { brand: pm.card.brand, last4: pm.card.last4 };
     }
-    
-    // Fallback: get from charge
-    const charge = paymentIntent?.charges?.data?.[0];
-    if (charge?.payment_method_details?.card) {
-      const card = charge.payment_method_details.card;
-      return {
-        brand: card.brand,
-        last4: card.last4,
-      };
+
+    // Fallback: latest_charge (not the removed `charges` list)
+    let charge = paymentIntent?.latest_charge;
+    if (typeof charge === "string") {
+      charge = await stripe.charges.retrieve(charge);
     }
-    
+    const card = charge?.payment_method_details?.card;
+    if (card) return { brand: card.brand, last4: card.last4 };
+
     return null;
   } catch (err) {
     console.error("Failed to fetch payment method:", err.message);
@@ -139,6 +139,13 @@ app.post(
           return res.status(404).json({ message: "Booking not found" });
         }
 
+        // Pay-after-service: Stripe sessions are only created for completed
+        // jobs; refuse to settle anything else even if a session exists.
+        if (booking.status !== "completed") {
+          console.error("Webhook refused non-completed booking:", bookingId);
+          return res.status(400).json({ message: "Booking is not completed" });
+        }
+
         const paymentData = {
           bookingId: String(booking._id),
           stripeSessionId: session.id,
@@ -181,7 +188,19 @@ app.post(
         try {
           await payments.updateOne(
             { stripeSessionId: session.id },
-            { $setOnInsert: paymentData },
+            {
+              $setOnInsert: paymentData,
+              // A retry must also be able to repair an older record that was
+              // saved before the receipt_url fix shipped.
+              ...(paymentData.receiptUrl && {
+                $set: {
+                  receiptUrl: paymentData.receiptUrl,
+                  ...(paymentData.paymentMethod && {
+                    paymentMethod: paymentData.paymentMethod,
+                  }),
+                },
+              }),
+            },
             { upsert: true }
           );
         } catch (err) {
@@ -221,6 +240,18 @@ app.post(
   }
 );
 
+
+// The assignment spells private endpoints with an /api prefix. The Next.js
+// app talks to the bare Express paths (e.g. /bookings), so accept both forms.
+// /api/admin/users -> /users (the admin guard is on the route itself).
+app.use((req, _res, next) => {
+  if (req.url.startsWith("/api/admin/")) {
+    req.url = req.url.slice("/api/admin".length);
+  } else if (req.url.startsWith("/api/")) {
+    req.url = req.url.slice("/api".length);
+  }
+  next();
+});
 
 // Normal JSON middleware AFTER Stripe webhook
 app.use(express.json());
@@ -264,6 +295,36 @@ const users = db.collection("users");
 const services = db.collection("services");
 const bookings = db.collection("bookings")
 const payments = db.collection("payments");
+
+// ---- Shared query helpers -------------------------------------------------
+const escapeRe = (value) =>
+  String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Case-insensitive, whole-value match (emails, exact mode names, ...).
+const ciExact = (value) => ({
+  $regex: `^${escapeRe(value)}$`,
+  $options: "i",
+});
+
+// Category matching that treats "Laptop & PC", "laptop-pc" and "LAPTOP PC"
+// as the same category. This lets the home-page category cards and the
+// /services dropdown agree even though one uses slugs and one uses labels.
+const categoryMatcher = (value) => {
+  const parts = String(value ?? "")
+    .split(/[^a-zA-Z0-9]+/)
+    .filter(Boolean)
+    .map(escapeRe);
+
+  if (!parts.length) return undefined;
+  if (parts.length === 1) {
+    // A single word may be the start of a longer category ("laptop" -> "Laptop & PC").
+    return { $regex: `^${parts[0]}(?:[^a-zA-Z0-9].*)?$`, $options: "i" };
+  }
+  return {
+    $regex: `^${parts.join("[^a-zA-Z0-9]*")}$`,
+    $options: "i",
+  };
+};
 
 
 
@@ -419,35 +480,85 @@ app.get("/feature-services", async (req, res) => {
 
 
 
-// Get all services
+// Get all services — searching, filtering and sorting happen HERE, in MongoDB.
+// Public browse sends approvalStatus/isAvailable; technician dashboards send
+// technicianEmail/technicianId and deliberately omit those public filters.
 app.get("/services", async (req, res) => {
   try {
-    const { technicianEmail, technicianId } = req.query;
+    const {
+      technicianEmail,
+      technicianId,
+      search,
+      category,
+      mode,
+      sort,
+      approvalStatus,
+      isAvailable,
+    } = req.query;
+
     const query = {};
-    
-    // Case-insensitive email matching
-    if (technicianEmail) {
-      const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      query.technicianEmail = {
-        $regex: `^${escapeRegex(technicianEmail)}$`,
-        $options: "i",
-      };
+
+    if (technicianEmail) query.technicianEmail = ciExact(technicianEmail);
+    if (technicianId) query.technicianId = String(technicianId);
+    if (approvalStatus) query.approvalStatus = String(approvalStatus);
+    if (isAvailable === "true" || isAvailable === true) query.isAvailable = true;
+    if (mode) query.serviceMode = ciExact(mode);
+
+    const categoryFilter = category ? categoryMatcher(category) : undefined;
+    if (categoryFilter) query.category = categoryFilter;
+
+    // Search by service title or category. Match whole words (or word
+    // beginnings), so "AC" doesn't accidentally match "Wa-shing Ma-chine".
+    const term = String(search ?? "").trim();
+    if (term) {
+      const words = term.split(/\s+/).filter(Boolean).map(escapeRe);
+      let pattern = words
+        .map((word) => `(?:^|[^a-zA-Z0-9])${word}`)
+        .join("[^a-zA-Z0-9]*");
+      if (words.length === 1 && words[0].toLowerCase() === "ac") {
+        pattern = `(?:^|[^a-zA-Z0-9])(?:ac|air condition(?:er|ing))`;
+      }
+      query.$or = [
+        { title: { $regex: pattern, $options: "i" } },
+        { category: { $regex: pattern, $options: "i" } },
+      ];
     }
-    if (technicianId) query.technicianId = technicianId;
 
-    const data = await services
-      .find(query)
-      .sort({ createdAt: -1 })
-      .toArray();
+    // Sort entirely on the server. createdAt is the tie-breaker so documents
+    // without a createdAt still get a stable "newest first" order.
+    const sortSpec =
+      sort === "price-asc"
+        ? { basePrice: 1, _id: -1 }
+        : sort === "price-desc"
+        ? { basePrice: -1, _id: -1 }
+        : { createdAt: -1, _id: -1 };
 
+    const data = await services.find(query).sort(sortSpec).toArray();
     res.status(200).json(data);
   } catch (error) {
     console.error("Get services error:", error);
-
     res.status(500).json({
       success: false,
       message: "Failed to fetch services",
     });
+  }
+});
+
+// Category options for the browse dropdown (a stable list, independent of the
+// filters currently applied). Must be declared before /services/:id.
+app.get("/services/categories", async (_req, res) => {
+  try {
+    const rows = await services
+      .find({ approvalStatus: "approved", isAvailable: true })
+      .project({ category: 1 })
+      .toArray();
+    const categories = [
+      ...new Set(rows.map((r) => String(r.category || "").trim()).filter(Boolean)),
+    ].sort((a, b) => a.localeCompare(b));
+    res.status(200).json(categories);
+  } catch (error) {
+    console.error("Get service categories error:", error);
+    res.status(500).json({ message: "Failed to fetch categories." });
   }
 });
 
@@ -463,6 +574,12 @@ app.patch("/users/:id/role",verifyToken, verifyAdmin,  async (req, res) => {
 
     if (!["customer", "technician", "admin"].includes(role)) {
       return res.status(400).json({ message: "Invalid role." });
+    }
+
+    // An admin may never change their own role — the UI disables it, but the
+    // API must enforce it too so a direct request cannot self-demote/promote.
+    if (String(id) === String(req.user._id)) {
+      return res.status(403).json({ message: "You cannot change your own role." });
     }
 
     const result = await users.updateOne(
@@ -616,9 +733,10 @@ app.post("/services",verifyToken, verifyTechnician, async (req, res) => {
 });
 
 
-app.patch("/services",verifyToken, verifyTechnician, async (req, res) => {
+async function updateServiceHandler(req, res) {
   try {
-    const { id, technicianId, ...updates } = req.body;
+    const { technicianId, ...updates } = req.body;
+    const id = req.params.id || req.body.id;
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({ message: "Invalid service id." });
@@ -750,7 +868,10 @@ app.patch("/services",verifyToken, verifyTechnician, async (req, res) => {
     console.error("Update service error:", error);
     res.status(500).json({ message: "Server error." });
   }
-});
+}
+
+app.patch("/services", verifyToken, verifyTechnician, updateServiceHandler);
+app.patch("/services/:id", verifyToken, verifyTechnician, updateServiceHandler);
 
 
 app.delete("/services/:id",verifyToken, verifyTechnician, async (req, res) => {
@@ -813,8 +934,38 @@ app.patch("/services/:id/approval", verifyToken, verifyAdmin, async (req, res) =
 });
 
 
-// Get all users
-app.get("/users", async (req, res) => {
+// Update the signed-in user's own profile. Identity comes from the JWT only —
+// there is no userId in the request, so one customer cannot edit another user.
+app.patch("/users/profile", verifyToken, async (req, res) => {
+  try {
+    const allowed = ["name", "phone", "area", "bio", "image"];
+    const updates = {};
+
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) {
+        updates[key] = req.body[key] === null ? null : String(req.body[key]);
+      }
+    }
+
+    if (Object.hasOwn(updates, "name") && !updates.name.trim()) {
+      return res.status(400).json({ message: "Name cannot be empty." });
+    }
+
+    await users.updateOne(
+      { _id: req.user._id },
+      { $set: { ...updates, updatedAt: new Date() } }
+    );
+
+    const updated = await users.findOne({ _id: req.user._id });
+    res.status(200).json(updated);
+  } catch (err) {
+    console.error("Update profile error:", err);
+    res.status(500).json({ message: "Failed to update profile." });
+  }
+});
+
+// Get all users — private admin data.
+app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const data = await users.find().toArray();
 
@@ -832,9 +983,20 @@ app.get("/users", async (req, res) => {
 //booking related api
 
 
-app.get("/bookings",verifyToken, async (req, res) => {
+// `forced` is "customer" or "technician" for the dedicated /my and
+// /technician routes: those derive the identity from the JWT, never from a
+// query parameter, so a user cannot read someone else's bookings by changing
+// the URL. The generic /bookings route still supports admins listing any.
+async function listBookingsHandler(req, res, forced) {
   try {
-    const { email, technicianEmail } = req.query;
+    let { email, technicianEmail } = req.query;
+    if (forced === "customer") {
+      email = req.user.email;
+      technicianEmail = undefined;
+    } else if (forced === "technician") {
+      technicianEmail = req.user.email;
+      email = undefined;
+    }
 
     if (!email && !technicianEmail) {
       return res
@@ -948,7 +1110,21 @@ app.get("/bookings",verifyToken, async (req, res) => {
   } catch (err) {
     res.status(500).json({ message: "Server error." });
   }
-});
+}
+
+app.get("/bookings", verifyToken, listBookingsHandler);
+app.get(
+  "/bookings/my",
+  verifyToken,
+  verifyCustomer,
+  (req, res) => listBookingsHandler(req, res, "customer")
+);
+app.get(
+  "/bookings/technician",
+  verifyToken,
+  verifyTechnician,
+  (req, res) => listBookingsHandler(req, res, "technician")
+);
 
 app.get("/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
   try {
@@ -976,6 +1152,9 @@ app.get("/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
 app.post("/bookings",verifyToken, verifyCustomer,async (req, res) => {
   try {
     const b = req.body;
+
+    // Ownership is decided by the token, never by a client-supplied email.
+    b.customerEmail = req.user.email;
 
     if (
       !b.serviceId ||
@@ -1076,54 +1255,119 @@ app.post("/bookings",verifyToken, verifyCustomer,async (req, res) => {
 });
 
 
-app.patch("/bookings/:id/status",verifyToken, async (req, res) => {
+// A customer may only cancel their OWN booking. Identity comes from the JWT,
+// so changing an email in the URL/body cannot target someone else's job.
+app.patch("/bookings/:id/cancel", verifyToken, verifyCustomer, async (req, res) => {
   try {
-    const { status, customerEmail, technicianEmail, finalAmount } = req.body;
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ message: "Invalid booking id." });
+    }
+
+    const booking = await bookings.findOne({
+      _id: new ObjectId(req.params.id),
+      customerEmail: ciExact(req.user.email),
+    });
+
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found." });
+    }
+
+    if (!["requested", "accepted", "in-progress"].includes(booking.status)) {
+      return res
+        .status(409)
+        .json({ message: "This booking can no longer be cancelled." });
+    }
+
+    await bookings.updateOne(
+      { _id: booking._id },
+      { $set: { status: "cancelled", updatedAt: new Date() } }
+    );
+
+    res.status(200).json({ ...booking, status: "cancelled" });
+  } catch (err) {
+    console.error("Cancel booking error:", err);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+// Only the technician who OWNS the job can move it through the status pipeline.
+// The caller is taken from the verified token — a body-supplied email is never
+// trusted for identity (it is ignored entirely).
+app.patch("/bookings/:id/status", verifyToken, verifyTechnician, async (req, res) => {
+  try {
+    const { status, finalAmount } = req.body;
 
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ message: "Invalid booking id." });
     }
 
-    if (
-      ![
-        "requested",
-        "accepted",
-        "in-progress",
-        "completed",
-        "cancelled",
-        "rejected",
-      ].includes(status)
-    ) {
-      return res.status(400).json({ message: "Invalid status." });
-    }
-
-    if (!customerEmail && !technicianEmail) {
-      return res
-        .status(400)
-        .json({ message: "Either customerEmail or technicianEmail is required." });
-    }
-
-    // The caller must really be the party they claim to be.
-    const me = String(req.user.email).toLowerCase();
-    if (
-      (customerEmail && String(customerEmail).toLowerCase() !== me) ||
-      (technicianEmail && String(technicianEmail).toLowerCase() !== me)
-    ) {
-      return res.status(403).json({ message: "Forbidden" });
-    }
-
-    // Technicians move jobs forward; customers can only cancel their own.
     const TECHNICIAN_STATUSES = ["accepted", "in-progress", "completed", "rejected"];
-    if (
-      technicianEmail
-        ? !TECHNICIAN_STATUSES.includes(status)
-        : status !== "cancelled"
-    ) {
+    if (!TECHNICIAN_STATUSES.includes(status)) {
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    if (finalAmount !== undefined) {
-      const amt = Number(finalAmount);
+    const me = String(req.user.email).toLowerCase();
+
+    // Normal case: the booking carries the technician's email.
+    let booking = await bookings.findOne({
+      _id: new ObjectId(req.params.id),
+      technicianEmail: ciExact(req.user.email),
+    });
+
+    // Legacy case: technicianEmail is null — join through service -> technician.
+    if (!booking) {
+      const doc = await bookings.findOne({ _id: new ObjectId(req.params.id) });
+      if (doc && !doc.technicianEmail && doc.serviceId) {
+        let svcId = doc.serviceId;
+        if (typeof svcId === "string" && ObjectId.isValid(svcId)) {
+          svcId = new ObjectId(svcId);
+        }
+        const svc = await services.findOne({ _id: svcId });
+        let techEmail = svc?.technicianEmail;
+
+        if (!techEmail && svc?.technicianId) {
+          let tech = null;
+          if (ObjectId.isValid(svc.technicianId)) {
+            tech = await users.findOne({ _id: new ObjectId(svc.technicianId) });
+          }
+          if (!tech) tech = await users.findOne({ _id: svc.technicianId });
+          techEmail = tech?.email;
+        }
+
+        if (techEmail && String(techEmail).toLowerCase() === me) {
+          booking = doc;
+          await bookings.updateOne(
+            { _id: doc._id },
+            { $set: { technicianEmail: techEmail } }
+          );
+        }
+      }
+    }
+
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found." });
+    }
+
+    // One-way pipeline. Terminal states (completed / cancelled / rejected)
+    // are locked, so a job can never be re-opened or "un-completed".
+    const ALLOWED_TRANSITIONS = {
+      requested: ["accepted", "rejected"],
+      accepted: ["in-progress", "rejected"],
+      "in-progress": ["completed", "rejected"],
+      completed: [],
+      cancelled: [],
+      rejected: [],
+    };
+
+    const current = booking.status;
+    if (!(ALLOWED_TRANSITIONS[current] ?? []).includes(status)) {
+      return res.status(409).json({
+        message: `Cannot move a ${current} booking to ${status}.`,
+      });
+    }
+
+    if (status === "completed") {
+      const amt = Number(finalAmount ?? booking.finalAmount ?? booking.basePrice);
       if (!Number.isFinite(amt) || amt <= 0) {
         return res
           .status(400)
@@ -1131,100 +1375,22 @@ app.patch("/bookings/:id/status",verifyToken, async (req, res) => {
       }
     }
 
-    // Ownership check — the caller must be one of the two parties.
-    // For technicians, we need to handle the case where booking.technicianEmail is null
-    // by resolving it from the service's technicianId
-    let finalTechnicianEmail = technicianEmail;
-    if (technicianEmail) {
-      // First check if the booking actually has this technicianEmail or null
-      const bookingDoc = await bookings.findOne({
-        _id: new ObjectId(req.params.id),
-        projection: { technicianEmail: 1, serviceId: 1 }
-      });
-      
-      if (bookingDoc) {
-        if (!bookingDoc.technicianEmail && bookingDoc.serviceId) {
-          // Booking has null technicianEmail - resolve from service
-          // serviceId in bookings is stored as a string, convert to ObjectId
-          let svcId = bookingDoc.serviceId;
-          if (typeof svcId === "string" && ObjectId.isValid(svcId)) {
-            svcId = new ObjectId(svcId);
-          }
-          const serviceDoc = await db.collection("services").findOne({
-            _id: svcId
-          });
-          if (serviceDoc?.technicianId) {
-            // technicianId may be a string (better-auth) or ObjectId
-            let tech = null;
-            if (ObjectId.isValid(serviceDoc.technicianId)) {
-              tech = await users.findOne({
-                _id: new ObjectId(serviceDoc.technicianId)
-              });
-            }
-            if (!tech) {
-              tech = await users.findOne({
-                _id: serviceDoc.technicianId
-              });
-            }
-            if (tech?.email && String(tech.email).toLowerCase() === me) {
-              finalTechnicianEmail = tech.email;
-            }
-          }
-        }
-      }
-    }
-
-    const ownerQuery = {};
-    if (customerEmail) ownerQuery.customerEmail = customerEmail;
-    if (finalTechnicianEmail) ownerQuery.technicianEmail = finalTechnicianEmail;
-
-    const booking = await bookings.findOne({
-      _id: new ObjectId(req.params.id),
-      ...ownerQuery,
-    });
-
-    if (!booking) {
-      return res.status(404).json({ message: "Booking not found." });
-    }
-
-    // ---- Transition guard -------------------------------------------------
-    // Each status can only move forward along the agreed path; terminal states
-    // are locked. This is what stops a completed job being "un-completed".
-    const ALLOWED_TRANSITIONS = {
-      requested: ["accepted", "rejected", "cancelled"],
-      accepted: ["in-progress", "rejected", "cancelled"],
-      "in-progress": ["completed", "rejected", "cancelled"],
-      completed: [],
-      cancelled: [],
-      rejected: [],
-    };
-
-    const current = booking.status;
-    const allowed = ALLOWED_TRANSITIONS[current] ?? [];
-
-    if (!allowed.includes(status)) {
-      return res.status(409).json({
-        message: `Cannot move a ${current} booking to ${status}.`,
-      });
-    }
-
     await bookings.updateOne(
       { _id: booking._id },
       {
         $set: {
           status,
-          // `finalAmount` is OPTIONAL — only meaningful when completing a job
-          // (the technician sets the final price). Ignored for every other
-          // transition so the existing basePrice is preserved.
-          ...(technicianEmail &&
-            status === "completed" &&
-            finalAmount !== undefined && { finalAmount: Number(finalAmount) }),
+          ...(status === "completed" && {
+            finalAmount: Number(
+              finalAmount ?? booking.finalAmount ?? booking.basePrice
+            ),
+          }),
           updatedAt: new Date(),
         },
       }
     );
 
-    res.status(200).json({ ...booking, status, ...(finalAmount !== undefined ? { finalAmount } : {}) });
+    res.status(200).json({ ...booking, status });
   } catch (err) {
     console.error("Patch booking status error:", err);
     res.status(500).json({ message: "Server error." });
@@ -1304,9 +1470,8 @@ app.patch(
   }
 );
 
-app.delete('/bookings/:id', async(req,res)=>{
-
-})
+// (The old DELETE /bookings/:id stub was removed — it had no auth and never
+// sent a response, so it has been replaced by the protected cancel endpoint.)
 
 //Payment related API's
 
@@ -1320,17 +1485,33 @@ app.post("/payments/create-checkout-session", verifyToken, verifyCustomer, async
       return res.status(400).json({ message: "Invalid booking ID" });
     }
 
+    // Payment gate #1: only the booking's own customer can pay for it.
     const booking = await bookings.findOne({
       _id: new ObjectId(bookingId),
-      customerEmail: req.user.email
+      customerEmail: ciExact(req.user.email),
     });
 
     if (!booking) {
       return res.status(404).json({ message: "Booking not found" });
     }
 
-    if (booking.paymentStatus === "paid") {
+    // Pay-after-service: a job can only be paid for once the technician has
+    // marked it completed. The UI hides Pay Now earlier, but enforce it here
+    // so a direct API call cannot pay for a requested/accepted booking.
+    if (booking.status !== "completed") {
+      return res.status(400).json({
+        message: "Payment is only available for completed jobs.",
+      });
+    }
+
+    if (booking.paymentStatus === "paid" || booking.paidAt) {
       return res.status(400).json({ message: "Already paid" });
+    }
+
+    // The amount is ALWAYS derived from the stored job, never from the client.
+    const amount = Number(booking.finalAmount ?? booking.basePrice);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ message: "Invalid payment amount." });
     }
 
     const session = await stripe.checkout.sessions.create({
@@ -1341,11 +1522,13 @@ app.post("/payments/create-checkout-session", verifyToken, verifyCustomer, async
             name: booking.serviceTitle,
             description: `Service by ${booking.technicianName}`,
           },
-          unit_amount: Math.round((booking.finalAmount || booking.basePrice) * 100),
+          unit_amount: Math.round(amount * 100),
         },
         quantity: 1,
       }],
       mode: "payment",
+      // Stripe only creates a hosted receipt when it knows the receipt email.
+      customer_email: booking.customerEmail,
       success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
       metadata: {
@@ -1386,6 +1569,17 @@ app.post("/payments/verify", verifyToken, verifyCustomer, async (req, res) => {
       return res.status(200).json({ paid: false });
     }
 
+    // The browser-redirect path must confirm this session belongs to the
+    // signed-in customer. (The webhook path is Stripe-signed and needs no
+    // such check.) Without this, anyone holding a session id could settle it.
+    const sessionEmail = session.metadata?.customerEmail;
+    if (
+      !sessionEmail ||
+      String(sessionEmail).toLowerCase() !== String(req.user.email).toLowerCase()
+    ) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
     const bookingId = session.metadata?.bookingId;
 
     if (!bookingId || !ObjectId.isValid(bookingId)) {
@@ -1404,9 +1598,19 @@ app.post("/payments/verify", verifyToken, verifyCustomer, async (req, res) => {
       });
     }
 
-    const booking = await bookings.findOne({ _id: new ObjectId(bookingId) });
+    // Payment gate #2: the session must belong to this customer's completed
+    // job. Re-check against the database, not just Stripe metadata.
+    const booking = await bookings.findOne({
+      _id: new ObjectId(bookingId),
+      customerEmail: ciExact(req.user.email),
+    });
     if (!booking) {
-      return res.status(404).json({ message: "Booking not found." });
+      return res.status(403).json({ message: "Forbidden" });
+    }
+    if (booking.status !== "completed") {
+      return res.status(400).json({
+        message: "Payment is only available for completed jobs.",
+      });
     }
 
     const paymentData = {
@@ -1424,6 +1628,17 @@ app.post("/payments/verify", verifyToken, verifyCustomer, async (req, res) => {
       paidAt: new Date(),
       createdAt: new Date(),
     };
+
+    // Store the receipt URL at settlement time too. Without this, the browser
+    // redirect path relied entirely on the on-demand fetch to fill it in.
+    if (paymentData.stripePaymentIntentId) {
+      paymentData.receiptUrl = await fetchReceiptUrl(
+        paymentData.stripePaymentIntentId
+      );
+      paymentData.paymentMethod = await fetchPaymentMethod(
+        paymentData.stripePaymentIntentId
+      );
+    }
 
     try {
       await payments.insertOne(paymentData);
@@ -1497,15 +1712,30 @@ app.get("/payments",verifyToken, verifyCustomer, async (req, res) => {
     const paymentRecords = await payments
       .find({ bookingId: { $in: docs.map((b) => String(b._id)) } })
       .toArray();
+    // Prefer the settled record when more than one exists for a booking (an
+    // old `pending` placeholder must never shadow the real Stripe payment).
+    const settledRecords = paymentRecords
+      .filter(
+        (p) =>
+          p.paymentStatus === "paid" ||
+          p.paidAt ||
+          p.stripePaymentIntentId
+      )
+      .sort(
+        (a, b) =>
+          Number(Boolean(b.paidAt || b.paymentStatus === "paid")) -
+          Number(Boolean(a.paidAt || a.paymentStatus === "paid"))
+      );
+
     const intentByBooking = new Map(
-      paymentRecords.map((p) => [p.bookingId, p.stripePaymentIntentId])
+      settledRecords.map((p) => [p.bookingId, p.stripePaymentIntentId])
     );
     
     // Build receipt URL and payment method maps, fetching missing ones from Stripe on-demand
     const receiptByBooking = new Map();
     const paymentMethodByBooking = new Map();
     
-    for (const p of paymentRecords) {
+    for (const p of settledRecords) {
       // Fetch receipt URL if missing
       if (p.receiptUrl) {
         receiptByBooking.set(p.bookingId, p.receiptUrl);
