@@ -790,7 +790,7 @@ app.post("/bookings",verifyToken, verifyCustomer,async (req, res) => {
 
 app.patch("/bookings/:id/status",verifyToken, async (req, res) => {
   try {
-    const { status, customerEmail, technicianEmail } = req.body;
+    const { status, customerEmail, technicianEmail, finalAmount } = req.body;
 
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ message: "Invalid booking id." });
